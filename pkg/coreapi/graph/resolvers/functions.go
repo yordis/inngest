@@ -11,38 +11,18 @@ import (
 )
 
 func (r *queryResolver) Functions(ctx context.Context) ([]*models.Function, error) {
-	fns, err := r.APIReadWriter.Functions(ctx)
+	all, err := r.Data.GetFunctions(ctx)
 	if err != nil {
 		return nil, err
 	}
-
-	var functions []*models.Function
-	for _, fn := range fns {
-		var triggers []*models.FunctionTrigger
-
-		for _, trigger := range fn.Triggers {
-			t := &models.FunctionTrigger{}
-			if trigger.EventTrigger != nil {
-				t.Type = models.FunctionTriggerTypesEvent
-				t.Value = trigger.Event
-			}
-			if trigger.CronTrigger != nil {
-				t.Type = models.FunctionTriggerTypesCron
-				t.Value = trigger.Cron
-			}
-			triggers = append(triggers, t)
+	res := make([]*models.Function, len(all))
+	for n, i := range all {
+		res[n], err = models.MakeFunction(i)
+		if err != nil {
+			return nil, err
 		}
-
-		functions = append(functions, &models.Function{
-			ID:          fn.Name,
-			Name:        fn.Name,
-			Concurrency: fn.ConcurrencyLimit(),
-			Triggers:    triggers,
-			URL:         fn.Steps[0].URI,
-		})
 	}
-
-	return functions, nil
+	return res, nil
 }
 
 func (r *queryResolver) FunctionRun(ctx context.Context, query models.FunctionRunQuery) (*models.FunctionRun, error) {
@@ -62,7 +42,8 @@ func (r *queryResolver) FunctionRun(ctx context.Context, query models.FunctionRu
 
 	status := models.FunctionRunStatusRunning
 
-	switch state.Metadata().Status {
+	m := state.Metadata()
+	switch m.Status {
 	case enums.RunStatusCompleted:
 		status = models.FunctionRunStatusCompleted
 	case enums.RunStatusFailed:
@@ -71,21 +52,30 @@ func (r *queryResolver) FunctionRun(ctx context.Context, query models.FunctionRu
 		status = models.FunctionRunStatusCancelled
 	}
 
-	startedAt := ulid.Time(runID.Time())
 	name := state.Function().Name
 
-	pending := state.Metadata().Pending
-	if pending < 0 {
-		pending = 0
+	pending, _ := r.Queue.OutstandingJobCount(
+		ctx,
+		m.Identifier.WorkspaceID,
+		m.Identifier.WorkflowID,
+		m.Identifier.RunID,
+	)
+
+	run, err := r.Data.GetFunctionRun(
+		ctx,
+		m.Identifier.AccountID,
+		m.Identifier.WorkspaceID,
+		runID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("Run ID not found: %w", err)
 	}
 
-	return &models.FunctionRun{
-		ID:           runID.String(),
-		Name:         &name,
-		Status:       &status,
-		PendingSteps: &pending,
-		StartedAt:    &startedAt,
-	}, nil
+	fr := models.MakeFunctionRun(run)
+	fr.PendingSteps = &pending
+	fr.Name = &name
+	fr.Status = &status
+	return fr, nil
 }
 
 func (r *queryResolver) FunctionRuns(ctx context.Context, query models.FunctionRunsQuery) ([]*models.FunctionRun, error) {
@@ -112,12 +102,12 @@ func (r *queryResolver) FunctionRuns(ctx context.Context, query models.FunctionR
 		startedAt := ulid.Time(m.Identifier.RunID.Time())
 
 		name := s.Function().Name
-		pending := int(m.Pending)
-
-		// Don't let pending be negative for clients
-		if pending < 0 {
-			pending = 0
-		}
+		pending, _ := r.Queue.OutstandingJobCount(
+			ctx,
+			m.Identifier.WorkspaceID,
+			m.Identifier.WorkflowID,
+			m.Identifier.RunID,
+		)
 
 		runs = append(runs, &models.FunctionRun{
 			ID:           m.Identifier.RunID.String(),

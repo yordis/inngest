@@ -31,6 +31,10 @@ type KeyGenerator interface {
 	// given workflow run.
 	Event(context.Context, state.Identifier) string
 
+	// Events returns the key used to store the specific batch for the
+	// given workflow run.
+	Events(context.Context, state.Identifier) string
+
 	// Actions returns the key used to store the action response map used
 	// for given workflow run - ie. the results for individual steps.
 	Actions(context.Context, state.Identifier) string
@@ -58,6 +62,13 @@ type KeyGenerator interface {
 	// PauseStep returns the key used to store a pause ID by the run ID and step ID.
 	PauseStep(context.Context, state.Identifier, string) string
 
+	// PauseIndex is a key that's used to index added/expired times for pauses.
+	//
+	// Added times are necessary to load pauses after a specific point in time,
+	// which is used when caching pauses in-memory to only load the subset of pauses
+	// added after the cache was last updated.
+	PauseIndex(ctx context.Context, kind string, wsID uuid.UUID, event string) string
+
 	// History returns the key used to store a log entry for run hisotry
 	History(ctx context.Context, runID ulid.ULID) string
 
@@ -83,6 +94,10 @@ func (d DefaultKeyFunc) Workflow(ctx context.Context, id uuid.UUID, version int)
 
 func (d DefaultKeyFunc) Event(ctx context.Context, id state.Identifier) string {
 	return fmt.Sprintf("%s:events:%s:%s", d.Prefix, id.WorkflowID, id.RunID)
+}
+
+func (d DefaultKeyFunc) Events(ctx context.Context, id state.Identifier) string {
+	return fmt.Sprintf("%s:bulk-events:%s:%s", d.Prefix, id.WorkflowID, id.RunID)
 }
 
 func (d DefaultKeyFunc) Actions(ctx context.Context, id state.Identifier) string {
@@ -112,6 +127,13 @@ func (d DefaultKeyFunc) PauseStepPrefix(ctx context.Context, id state.Identifier
 func (d DefaultKeyFunc) PauseStep(ctx context.Context, id state.Identifier, step string) string {
 	prefix := d.PauseStepPrefix(ctx, id)
 	return fmt.Sprintf("%s-%s", prefix, step)
+}
+
+func (d DefaultKeyFunc) PauseIndex(ctx context.Context, kind string, wsID uuid.UUID, event string) string {
+	if event == "" {
+		return fmt.Sprintf("%s:pause-idx:%s:%s:-", d.Prefix, kind, wsID)
+	}
+	return fmt.Sprintf("%s:pause-idx:%s:%s:%s", d.Prefix, kind, wsID, event)
 }
 
 func (d DefaultKeyFunc) History(ctx context.Context, runID ulid.ULID) string {
@@ -152,6 +174,35 @@ type QueueKeyGenerator interface {
 	// have in-progress work.  This allows us to scan and scavenge jobs in concurrency queues where
 	// leases have expired (in the case of failed workers)
 	ConcurrencyIndex() string
+
+	// BatchPointer returns the key used as the pointer reference to the
+	// actual batch
+	BatchPointer(context.Context, uuid.UUID) string
+
+	// Batch returns the key used to store the specific batch of
+	// events, that is used to trigger a function run
+	Batch(context.Context, ulid.ULID) string
+
+	// BatchMetadata returns the key used to store the metadata related
+	// to a batch
+	BatchMetadata(context.Context, ulid.ULID) string
+
+	// RunIndex returns the index for storing job IDs associated with run IDs.
+	RunIndex(runID ulid.ULID) string
+
+	// Status returns the key used for status queue for the provided function.
+	Status(status string, fnID uuid.UUID) string
+}
+
+type DebounceKeyGenerator interface {
+	// QueueItem returns the key for the hash containing all items within a
+	// queue for a function.  This is used to check leases on debounce jobs.
+	QueueItem() string
+	// DebouncePointer returns the key which stores the pointer to the current debounce
+	// for a given function.
+	DebouncePointer(ctx context.Context, fnID uuid.UUID, key string) string
+	// Debounce returns the key for storing debounce-related data given a debounce ID.
+	Debounce(ctx context.Context) string
 }
 
 type DefaultQueueKeyGenerator struct {
@@ -200,4 +251,36 @@ func (d DefaultQueueKeyGenerator) Concurrency(prefix, key string) string {
 
 func (d DefaultQueueKeyGenerator) ConcurrencyIndex() string {
 	return fmt.Sprintf("%s:concurrency:sorted", d.Prefix)
+}
+
+func (d DefaultQueueKeyGenerator) BatchPointer(ctx context.Context, workflowID uuid.UUID) string {
+	return fmt.Sprintf("%s:workflows:%s:batch", d.Prefix, workflowID)
+}
+
+func (d DefaultQueueKeyGenerator) Batch(ctx context.Context, batchID ulid.ULID) string {
+	return fmt.Sprintf("%s:batches:%s", d.Prefix, batchID)
+}
+
+func (d DefaultQueueKeyGenerator) BatchMetadata(ctx context.Context, batchID ulid.ULID) string {
+	return fmt.Sprintf("%s:metadata", d.Batch(ctx, batchID))
+}
+
+// DebouncePointer returns the key which stores the pointer to the current debounce
+// for a given function.
+func (d DefaultQueueKeyGenerator) DebouncePointer(ctx context.Context, fnID uuid.UUID, key string) string {
+	return fmt.Sprintf("%s:debounce-ptrs:%s:%s", d.Prefix, fnID, key)
+}
+
+// Debounce returns the key for storing debounce-related data given a debounce ID.
+// This is a hash of debounce IDs -> debounces.
+func (d DefaultQueueKeyGenerator) Debounce(ctx context.Context) string {
+	return fmt.Sprintf("%s:debounce-hash", d.Prefix)
+}
+
+func (d DefaultQueueKeyGenerator) RunIndex(runID ulid.ULID) string {
+	return fmt.Sprintf("%s:idx:run:%s", d.Prefix, runID)
+}
+
+func (d DefaultQueueKeyGenerator) Status(status string, fnID uuid.UUID) string {
+	return fmt.Sprintf("%s:queue:status:%s:%s", d.Prefix, fnID, status)
 }

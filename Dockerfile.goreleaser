@@ -1,4 +1,4 @@
-FROM --platform=$BUILDPLATFORM alpine:3.16 AS inngest
-RUN apk add --no-cache ca-certificates tzdata && update-ca-certificates
+FROM --platform=$BUILDPLATFORM debian:stable-slim AS inngest
+RUN apt-get update && apt-get install -y ca-certificates tzdata && update-ca-certificates
 COPY inngest /bin/inngest
 CMD ["inngest"]

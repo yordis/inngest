@@ -5,6 +5,7 @@ import (
 	"os"
 	"runtime"
 	"sync"
+	"time"
 
 	"github.com/inngest/inngest/pkg/inngest/clistate"
 	"github.com/inngest/inngest/pkg/inngest/version"
@@ -15,12 +16,17 @@ import (
 const (
 	EventName   = "cli/command.executed"
 	CIEventName = "cli/ci.command.executed"
-	key         = "5_Jx-3FAkDMeddntV-KlZy1sbjY8UU1cqn2viGMPlv9Gq-0tWYaukPkUVbD04Zo-1SO2AF2dwnMv7rcHyhJzVQ"
 )
 
 var (
-	client = inngestgo.NewClient(key)
-	wg     *sync.WaitGroup
+	key = "5_Jx-3FAkDMeddntV-KlZy1sbjY8UU1cqn2viGMPlv9Gq-0tWYaukPkUVbD04Zo-1SO2AF2dwnMv7rcHyhJzVQ"
+)
+
+var (
+	client = inngestgo.NewClient(inngestgo.ClientOpts{
+		EventKey: &key,
+	})
+	wg *sync.WaitGroup
 )
 
 func init() {
@@ -75,7 +81,7 @@ func (m *Metadata) Event() inngestgo.Event {
 			"os":          m.OS,
 			"context":     m.Context,
 		},
-		Timestamp: inngestgo.Now(),
+		Timestamp: time.Now().UnixMilli(),
 		Version:   "2022-12-16",
 	}
 }

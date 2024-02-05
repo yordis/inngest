@@ -32,16 +32,72 @@ var (
 	ErrFunctionComplete   = fmt.Errorf("function completed")
 	ErrFunctionFailed     = fmt.Errorf("function failed")
 	ErrFunctionOverflowed = fmt.Errorf("function has too many steps")
+	ErrDuplicateResponse  = fmt.Errorf("duplicate response")
 )
 
 // Identifier represents the unique identifier for a workflow run.
 type Identifier struct {
-	WorkflowID      uuid.UUID `json:"wID"`
-	WorkflowVersion int       `json:"wv"`
-	RunID           ulid.ULID `json:"runID"`
-	// Key represents a unique idempotency key used to deduplicate this
-	// workflow run amongst other runs for the same workflow.
-	Key string `json:"key"`
+	RunID ulid.ULID `json:"runID"`
+	// WorkflowID tracks the internal ID of the function
+	WorkflowID uuid.UUID `json:"wID"`
+	// WorkflowVersion tracks the version of the function that was live
+	// at the time of the trigger.
+	WorkflowVersion int `json:"wv"`
+	// StaticVersion indicates whether the workflow is pinned to the
+	// given function definition over the life of the function.  If functions
+	// are deployed to their own URLs, this ensures that the endpoint we hit
+	// for the function (and therefore code) stays the same.  Note:  this is only
+	// important when we people use separate endpoints per function version.
+	StaticVersion bool `json:"s,omitempty"`
+	// EventID tracks the event ID that started the function.
+	EventID ulid.ULID `json:"evtID"`
+	// BatchID tracks the batch ID for the function, if the function uses batching.
+	BatchID *ulid.ULID `json:"bID,omitempty"`
+	// EventIDs tracks all the events associated with the function run
+	EventIDs []ulid.ULID `json:"eventIDs"`
+	// Key represents a unique user-defined key to be used as part of the
+	// idempotency key.  This is appended to the workflow ID and workflow
+	// version to create a full idempotency key (via the IdempotencyKey() method).
+	//
+	// If this is not present the RunID is used as this value.
+	Key string `json:"key,omitempty"`
+	// AccountID represents the account ID for this run
+	AccountID uuid.UUID `json:"aID"`
+	// WorkspaceID represents the ws ID for this run
+	WorkspaceID uuid.UUID `json:"wsID"`
+	// AppID represents the app ID for this run
+	AppID uuid.UUID `json:"appID"`
+	// If this is a rerun, the original run ID is stored here.
+	OriginalRunID *ulid.ULID `json:"oRunID,omitempty"`
+	// ReplayID stores the ID of the replay, if this identifier belongs to a replay.
+	ReplayID *uuid.UUID `json:"rID,omitempty"`
+	// PriorityFactor is the overall priority factor for this particular function
+	// run.  This allows individual runs to take precedence within the same queue.
+	// The higher the number (up to consts.PriorityFactorMax), the higher priority
+	// this run has.  All next steps will use this as the factor when scheduling
+	// future edge jobs (on their first attempt).
+	PriorityFactor *int64 `json:"pf,omitempty"`
+	// CustomConcurrencyKeys stores custom concurrency keys for this function run.  This
+	// allows us to use custom concurrency keys for each job when processing steps for
+	// the function, with cached expression results.
+	CustomConcurrencyKeys []CustomConcurrency `json:"cck,omitempty"`
+}
+
+type CustomConcurrency struct {
+	// Key represents the actual evaluated concurrency key.
+	Key string `json:"k"`
+	// Hash represents the hash of the concurrency expression - unevaluated -
+	// as defined in the function.  This lets us look up the latest concurrency
+	// values as defined in the most recent version of the function and use
+	// these concurrency values.  Without this, it's impossible to adjust concurrency
+	// for in-progress functions.
+	Hash string `json:"h"`
+	// Limit represents the limit at the time the function started.  If the concurrency
+	// key is removed from the fn definition, this pre-computed value will be used instead.
+	//
+	// NOTE: If the value is removed from the last deployed function we could also disregard
+	// this concurrency key.
+	Limit int `json:"l"`
 }
 
 // IdempotencyKey returns the unique key used to represent this single
@@ -82,27 +138,44 @@ type Metadata struct {
 	// us to store whether this is eg. a manual retry
 	RunType *string `json:"runType,omitempty"`
 
-	// OriginalRunID stores the original run ID, if this run is a retry.
-	// This is some basic book-keeping.
-	OriginalRunID *ulid.ULID `json:"originalRunID,omitempty"`
-
 	// Name stores the name of the workflow as it started.
+	//
+	// DEPRECATED
 	Name string `json:"name"`
 
-	// Pending is the number of steps that have been enqueued but have
-	// not yet finalized.
+	// Version represents the version of _metadata_ in particular.
 	//
-	// Finalized refers to:
-	// - A step that has errored out and cannot be retried
-	// - A step that has retried a maximum number of times and will not
-	//   further be retried.
-	// - A step that has completed, and has its next steps (children in
-	//   the dag) enqueued. Note that the step must have its children
-	//   enqueued to be considered finalized.
-	Pending int `json:"pending"`
+	// TODO: This should be removed and made specific to each particular state
+	// implementation.
+	Version int `json:"version"`
+
+	// RequestVersion represents the executor request versioning/hashing style
+	// used to manage state.
+	//
+	// TS v3, Go, Rust, Elixir, and Java all use the same hashing style (1).
+	//
+	// TS v1 + v2 use a unique hashing style (0) which cannot be transferred
+	// to other languages.
+	//
+	// This lets us send the hashing style to SDKs so that we can execute in
+	// the correct format with backcompat guarantees built in.
+	//
+	// NOTE: We can only know this the first time an SDK is responding to a step.
+	RequestVersion int `json:"rv"`
 
 	// Context allows storing any other contextual data in metadata.
 	Context map[string]any `json:"ctx,omitempty"`
+
+	// DisableImmediateExecution is used to tell the SDK whether it should
+	// disallow immediate execution of steps as they are found.
+	DisableImmediateExecution bool `json:"disableImmediateExecution,omitempty"`
+}
+
+type MetadataUpdate struct {
+	Debugger                  bool           `json:"debugger"`
+	Context                   map[string]any `json:"ctx,omitempty"`
+	DisableImmediateExecution bool           `json:"disableImmediateExecution,omitempty"`
+	RequestVersion            int            `json:"rv"`
 }
 
 // State represents the current state of a fn run.  It is data-structure
@@ -135,7 +208,11 @@ type State interface {
 
 	// Event is the root data that triggers the workflow, which is typically
 	// an Inngest event.
-	Event() map[string]interface{}
+	Event() map[string]any
+
+	// Events is the list of events that are used to trigger the workflow,
+	// which is typically a list of Inngest event.
+	Events() []map[string]any
 
 	// Actions returns a map of all output from each individual action.
 	Actions() map[string]any
@@ -151,6 +228,9 @@ type State interface {
 	//
 	// Note that if an action has errored this should return false.
 	ActionComplete(id string) bool
+
+	CronSchedule() *string
+	IsCron() bool
 }
 
 // Manager represents a state manager which can both load and mutate state.
@@ -183,15 +263,15 @@ type FunctionCallback func(context.Context, Identifier, enums.RunStatus)
 
 // StateLoader allows loading of previously stored state based off of a given Identifier.
 type StateLoader interface {
+	// Exists checks whether the run ID exists.
+	Exists(ctx context.Context, runID ulid.ULID) (bool, error)
+
 	// Metadata returns run metadata for the given identifier.  It may be cheaper
 	// than a full load in cases where only the metadata is necessary.
 	Metadata(ctx context.Context, runID ulid.ULID) (*Metadata, error)
 
 	// Load returns run state for the given identifier.
 	Load(ctx context.Context, runID ulid.ULID) (State, error)
-
-	// History loads history for the given run identifier.
-	History(ctx context.Context, runID ulid.ULID) ([]History, error)
 
 	// IsComplete returns whether the given identifier is complete, ie. the
 	// pending count in the identifier's metadata is zero.
@@ -219,6 +299,8 @@ type Mutater interface {
 	// ErrIdentifierExists.
 	New(ctx context.Context, input Input) (State, error)
 
+	UpdateMetadata(ctx context.Context, runID ulid.ULID, md MetadataUpdate) error
+
 	// Cancel sets a function run metadata status to RunStatusCancelled, which prevents
 	// future execution of steps.
 	Cancel(ctx context.Context, i Identifier) error
@@ -226,57 +308,16 @@ type Mutater interface {
 	// SetStatus sets a status specifically.
 	SetStatus(ctx context.Context, i Identifier, status enums.RunStatus) error
 
-	// scheduled increases the scheduled count for a run's metadata.
-	//
-	// We need to store the total number of steps enqueued to calculate when a step function
-	// has finished execution.  If the state store is the same as the queuee (eg. an all-in-one
-	// MySQL store) it makes sense to atomically increase this when enqueueing the step.  However,
-	// we must provide compatibility for queues that exist separately to the state store (eg.
-	// SQS, Celery).  In thise cases recording that a step was scheduled is a separate step.
-	//
-	// Attempt is zero-indexed.
-	Scheduled(ctx context.Context, i Identifier, stepID string, attempt int, at *time.Time) error
-
-	// Started is called when a step is started.
-	//
-	// Attempt is zero-indexed.
-	Started(ctx context.Context, i Identifier, stepID string, attempt int) error
-
-	// Finalized increases the finalized count for a run's metadata. This must be called after
-	// storing a response and scheduling all child steps.  This MUST happen after child steps
-	// else the distributed waitgroup doesn't work;  the counter will go to 0 before being re-increased
-	// to N child steps.
-	//
-	// If a status is provided, the function status will be set _if_ there are no more in-progress
-	// steps running for this function run.  This lets the executor specify failed statuses if
-	// no step output was received for the last step, and the last step failed (eg. SaveResponse
-	// is a no-op and didn't set the status).
-	//
-	// Attempt is zero-indexed.
-	Finalized(ctx context.Context, i Identifier, stepID string, attempt int, status ...enums.RunStatus) error
-
 	// SaveResponse saves the driver response for the attempt to the backing state store.
 	//
-	// If the response is an error, this must store the error for the specific attempt, allowing
-	// visibility into each error when executing a step. If DriverResponse is final, this must push
-	// the step ID to the stack.
-	//
-	// Attempt is zero-indexed.
-	//
-	// This returns the position of this step in the stack, if the stack is modified.  For temporary
-	// errors the stack position is 0, ie. unmodified.
-	SaveResponse(ctx context.Context, i Identifier, r DriverResponse, attempt int) (int, error)
-
-	// SaveHistory allows saving arbitrary history records for a function run.  While most
-	// state store mutations save history automatically, in some circumstances (eg. generator noops)
-	// it's important to be able to manually save history.
-	SaveHistory(ctx context.Context, i Identifier, h History) error
-}
-
-// HistoryDeleter is an optional interface a state can implement, deleting specific history items
-// for a run.
-type HistoryDeleter interface {
-	DeleteHistory(ctx context.Context, runID ulid.ULID, historyID ulid.ULID) error
+	// SaveResponse must only be called to commit a steps data to state, eg. for final errors
+	// or for step output.
+	SaveResponse(
+		ctx context.Context,
+		i Identifier,
+		stepID string,
+		marshalledOutput string,
+	) error
 }
 
 // Input is the input for creating new state.  The required fields are Workflow,
@@ -286,9 +327,9 @@ type Input struct {
 	// Identifier represents the identifier
 	Identifier Identifier
 
-	// EventData is the input data for initializing the workflow run, eg. the
-	// original event data.
-	EventData map[string]any
+	// EventBatchData is the input data for initializing the workflow run,
+	// which is a list of EventData
+	EventBatchData []map[string]any
 
 	// Debugger represents whether this function was started via the debugger.
 	Debugger bool
@@ -296,10 +337,6 @@ type Input struct {
 	// RunType indicates the run type for this particular flow.  This allows
 	// us to store whether this is eg. a manual retry
 	RunType *string `json:"runType,omitempty"`
-
-	// OriginalRunID stores the original run ID, if this run is a retry.
-	// This is some basic book-keeping.
-	OriginalRunID *ulid.ULID `json:"originalRunID,omitempty"`
 
 	// Steps allows users to specify pre-defined steps to run workflows from
 	// arbitrary points.

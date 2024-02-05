@@ -1,0 +1,58 @@
+type Query {
+  apps: [App!]!
+
+  stream(query: StreamQuery!): [StreamItem!]!
+
+  # Get an individual event
+  event(query: EventQuery!): Event
+
+  # Get all events sent
+  events(query: EventsQuery!): [Event!]
+
+  # Get all functions registered
+  functions: [Function!]
+
+  # Get an individual function run
+  functionRun(query: FunctionRunQuery!): FunctionRun
+
+  # Get all function runs
+  functionRuns(query: FunctionRunsQuery!): [FunctionRun!]
+}
+
+input ActionVersionQuery {
+  dsn: String!
+  versionMajor: Int
+  versionMinor: Int
+}
+
+input EventQuery {
+  workspaceId: ID! = "local"
+  eventId: ID!
+}
+
+input EventsQuery {
+  workspaceId: ID! = "local"
+  lastEventId: ID
+}
+
+input FunctionRunQuery {
+  workspaceId: ID! = "local"
+  functionRunId: ID!
+}
+
+input FunctionRunsQuery {
+  workspaceId: ID! = "local"
+}
+
+input StreamQuery {
+  # This allows you to query for items after a specific time.  If
+  # not provided this defaults to the most recent items in the stream,
+  # eg now.
+  after: Time
+  # Before allows you to receive items in a stream before a specific time.
+  # This is useful as you can add the last stream item's time as the before
+  # field, ensuring that only new items are received.
+  before: Time
+  limit: Int! = 20
+  includeInternalEvents: Boolean
+}

@@ -1,15 +1,20 @@
+#!/usr/bin/env node
+import AdmZip from "adm-zip";
+import Debug from "debug";
 import fetch, { Response } from "node-fetch";
 import path from "path";
 import tar from "tar";
-import unzipper from "unzipper";
 import { URL } from "url";
+import packageJson from "./package.json";
+
+const rootDebug = Debug("inngest:cli");
 
 /**
  * A map of Node's `process.arch` to Golang's `$GOARCH` equivalent.
  */
 const archMap: Partial<Record<typeof process.arch, string>> = {
   arm64: "arm64",
-  x64: "x86_64",
+  x64: "amd64",
 };
 
 /**
@@ -42,17 +47,20 @@ const platformMap: Partial<
  * Fetches the supposed URL of the binary on GitHub for this version.
  */
 async function getBinaryUrl(): Promise<URL> {
-  const version = process.env.npm_package_version?.trim();
-
-  if (!version) {
-    throw new Error("Could not find package version to install binary");
-  }
+  const debug = rootDebug.extend("getBinaryUrl");
 
   const { arch, platform } = getArchPlatform();
+
+  debug({ arch, platform });
+
+  let version = packageJson.version.trim();
+  debug("package.json version:", version);
 
   const targetUrl = new URL(
     `https://cli.inngest.com/artifact/v${version}/inngest_${version}_${platform.platform}_${arch}${platform.extension}`
   );
+
+  debug("targetUrl:", targetUrl.href);
 
   return targetUrl;
 }
@@ -64,8 +72,17 @@ async function getBinaryUrl(): Promise<URL> {
  * @throws when the arch or platform are not supported by this script.
  */
 function getArchPlatform() {
+  const debug = rootDebug.extend("getArchPlatform");
+
   const arch = archMap[process.arch];
   const platform = platformMap[process.platform];
+
+  debug({
+    arch,
+    platform,
+    "process.arch": process.arch,
+    "process.platform": process.platform,
+  });
 
   if (!arch) {
     throw new Error(`Unsupported architecture: ${process.arch}`);
@@ -90,11 +107,15 @@ function downloadBinary(
    */
   url: URL
 ): Promise<Response> {
+  const debug = rootDebug.extend("downloadBinary");
+
   /**
    * Using `new Promise()` here so that we can use listeners when dealing with
    * the request in order to ensure it's valid without using the body.
    */
   return new Promise(async (resolve, reject) => {
+    debug("downloading binary from:", url.href);
+
     fetch(url.href, {
       redirect: "follow",
     })
@@ -133,12 +154,15 @@ function pipeBinaryToInstallLocation(
    */
   originalUrl: URL
 ): Promise<void> {
+  const debug = rootDebug.extend("pipeBinaryToInstallLocation");
+
   return new Promise<void>((resolve, reject) => {
     if (!res.body) {
       return reject(new Error("No body to pipe"));
     }
 
     const targetPath = path.resolve("./bin");
+    debug("targetPath:", targetPath);
 
     /**
      * A different unpacking strategy will be needed for every extension, so
@@ -149,6 +173,7 @@ function pipeBinaryToInstallLocation(
      */
     const strategies: Record<KnownExtension, () => void> = {
       [KnownExtension.Tar]: () => {
+        debug("unpacking using tar strategy");
         const untar = tar.extract({ cwd: targetPath });
 
         untar.on("error", reject);
@@ -157,12 +182,15 @@ function pipeBinaryToInstallLocation(
         res.body?.pipe(untar);
       },
       [KnownExtension.Zip]: () => {
-        const unzip = unzipper.Extract({ path: targetPath });
-
-        unzip.on("error", reject);
-        unzip.on("close", () => resolve());
-
-        res.body?.pipe(unzip);
+        debug("unpacking using zip strategy");
+        res
+          .buffer()
+          .then((buffer) => {
+            const zip = new AdmZip(buffer);
+            zip.extractAllTo(targetPath, true);
+            resolve();
+          })
+          .catch(reject);
       },
     };
 
@@ -182,10 +210,13 @@ function pipeBinaryToInstallLocation(
 }
 
 (async () => {
+  rootDebug("postinstall started");
+
   /**
    * Allow skipping this step for builds and local dev.
    */
   if (process.env.SKIP_POSTINSTALL) {
+    rootDebug("SKIP_POSTINSTALL was defined; skipping postinstall");
     process.exit(0);
   }
 
@@ -193,6 +224,7 @@ function pipeBinaryToInstallLocation(
     const binaryUrl = await getBinaryUrl();
     const req = await downloadBinary(binaryUrl);
     await pipeBinaryToInstallLocation(req, binaryUrl);
+    rootDebug("postinstall complete");
   } catch (err) {
     console.error(err);
     process.exit(1);

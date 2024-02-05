@@ -1,0 +1,285 @@
+scalar Time
+
+"""
+The environment for the function to be run: `"prod"` or `"test"`
+"""
+scalar Environment
+
+scalar Uint
+scalar ULID
+scalar UUID
+
+type Workspace {
+  id: ID!
+}
+
+type StreamItem {
+  id: ID!
+  trigger: String! # Event name or cron
+  type: StreamType!
+  createdAt: Time!
+  runs: [FunctionRun]
+}
+
+enum StreamType {
+  EVENT
+  CRON
+}
+
+type FunctionVersion {
+  functionId: ID!
+  version: Uint!
+  config: String!
+
+  validFrom: Time
+  validTo: Time
+  createdAt: Time!
+  updatedAt: Time!
+}
+
+type Event {
+  id: ID!
+  workspace: Workspace
+  name: String
+  createdAt: Time
+  payload: String
+  schema: String
+  status: EventStatus
+  pendingRuns: Int
+  # The total number of function runs triggered by this event.
+  totalRuns: Int
+  # The raw JSON of this event, as it would've be sent by the producer.
+  raw: String
+  functionRuns: [FunctionRun!]
+}
+
+enum EventStatus {
+  # The event has triggered one or more functions, none of them have failed, and
+  # some of are them are still running.
+  RUNNING
+
+  # The event has triggered one or more functions and all of them have completed
+  # successfully.
+  COMPLETED
+
+  # The event has triggered one or more functions and has paused for a period of
+  # time or is waiting for an event.
+  PAUSED
+
+  # The event has triggered one or more functions and all have failed.
+  FAILED
+
+  # The event has triggered one or more functions, at least one - but not all -
+  # have failed, and all have run finished running.
+  PARTIALLY_FAILED
+
+  # The event triggered no functions.
+  NO_FUNCTIONS
+}
+
+
+enum FunctionStatus {
+  RUNNING
+  COMPLETED
+  FAILED
+  CANCELLED
+  # todo: SLEEPING, WAITING FOR EVENT when this is available with queue changes.
+}
+
+type App {
+  id: ID!
+  name: String!
+  sdkLanguage: String!
+  sdkVersion: String!
+  framework: String
+  url: String
+  checksum: String
+  error: String
+  functions: [Function!]!
+
+  # These fields are UI convenience fields
+  connected: Boolean!
+  functionCount: Int!
+  autodiscovered: Boolean!
+}
+
+type Function {
+  id: String!
+  name: String!
+  slug: String!
+  config: String!
+  concurrency: Int!
+  triggers: [FunctionTrigger!]
+  url: String!
+  appID: String!
+  app: App!
+}
+
+enum FunctionTriggerTypes {
+  EVENT
+  CRON
+}
+
+type FunctionTrigger {
+  type: FunctionTriggerTypes!
+  value: String!
+}
+
+enum FunctionRunStatus {
+  COMPLETED
+  FAILED
+  CANCELLED
+  RUNNING
+}
+
+enum FunctionEventType {
+  STARTED
+  COMPLETED
+  FAILED
+  CANCELLED
+}
+
+type FunctionEvent {
+  workspace: Workspace
+  functionRun: FunctionRun
+  type: FunctionEventType
+  output: String
+  createdAt: Time
+}
+
+enum StepEventType {
+  SCHEDULED
+  STARTED
+  COMPLETED
+  ERRORED
+  FAILED
+  WAITING
+}
+
+type StepEvent {
+  workspace: Workspace
+  functionRun: FunctionRun
+  stepID: String
+  name: String
+  type: StepEventType
+  output: String
+  createdAt: Time
+  waitingFor: StepEventWait
+}
+
+union FunctionRunEvent = FunctionEvent | StepEvent
+
+type StepEventWait {
+  eventName: String
+  expression: String
+  expiryTime: Time!
+}
+
+type FunctionRun {
+  id: ID!
+  functionID: String!
+
+  # related fields
+  function: Function
+  workspace: Workspace
+  event: Event
+
+  status: FunctionRunStatus
+  waitingFor: StepEventWait
+  pendingSteps: Int @deprecated
+  startedAt: Time
+  finishedAt: Time
+  output: String # JSON encoded output of the function, or JSON encoded error if this is a failure.
+
+  history: [RunHistoryItem!]!
+  historyItemOutput(id: ULID!): String
+  name: String @deprecated # use the embedded function field instead.
+  eventID: ID!
+}
+
+enum HistoryType {
+	FunctionCancelled
+	FunctionCompleted
+	FunctionFailed
+	FunctionScheduled
+	FunctionStarted
+	FunctionStatusUpdated
+	None
+	StepCompleted
+	StepErrored
+	StepFailed
+	StepScheduled
+	StepSleeping
+	StepStarted
+	StepWaiting
+}
+
+enum HistoryStepType {
+  Run
+  Send
+  Sleep
+  Wait
+}
+
+type RunHistoryItem {
+  attempt: Int!
+  cancel: RunHistoryCancel
+  createdAt: Time!
+  functionVersion: Int!
+  groupID: UUID
+  id: ULID!
+  result: RunHistoryResult
+  sleep: RunHistorySleep
+  stepName: String
+  stepType: HistoryStepType
+  type: HistoryType!
+  url: String
+  waitForEvent: RunHistoryWaitForEvent
+  waitResult: RunHistoryWaitResult
+  invokeFunction: RunHistoryInvokeFunction
+  invokeFunctionResult: RunHistoryInvokeFunctionResult
+}
+
+type RunHistoryCancel {
+  eventID: ULID
+  expression: String
+  userID: UUID
+}
+
+type RunHistoryResult {
+  durationMS: Int!
+  errorCode: String
+  framework: String
+  platform: String
+  sdkLanguage: String!
+  sdkVersion: String!
+  sizeBytes: Int!
+}
+
+type RunHistorySleep {
+  until: Time!
+}
+
+type RunHistoryWaitForEvent {
+  eventName: String!
+  expression: String
+  timeout: Time!
+}
+
+type RunHistoryWaitResult {
+  eventID: ULID
+  timeout: Boolean!
+}
+
+type RunHistoryInvokeFunction {
+  eventID: ULID!
+  functionID: String!
+  correlationID: String!
+  timeout: Time!
+}
+
+type RunHistoryInvokeFunctionResult {
+  eventID: ULID
+  timeout: Boolean!
+  runID: ULID
+}

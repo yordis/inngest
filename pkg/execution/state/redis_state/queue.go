@@ -2,33 +2,39 @@ package redis_state
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"math"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	"golang.org/x/sync/semaphore"
 
 	"github.com/cespare/xxhash/v2"
-	json "github.com/goccy/go-json"
 	"github.com/google/uuid"
 	"github.com/hashicorp/go-multierror"
-	"github.com/inngest/inngest/pkg/execution/concurrency"
+	"github.com/inngest/inngest/pkg/backoff"
+	"github.com/inngest/inngest/pkg/consts"
 	osqueue "github.com/inngest/inngest/pkg/execution/queue"
+	"github.com/inngest/inngest/pkg/execution/state"
 	"github.com/inngest/inngest/pkg/logger"
 	"github.com/oklog/ulid/v2"
+	"github.com/redis/rueidis"
 	"github.com/rs/zerolog"
-	"github.com/rueian/rueidis"
 	"github.com/uber-go/tally/v4"
 	"go.opentelemetry.io/otel/trace"
 	"gonum.org/v1/gonum/stat/sampleuv"
 	"lukechampine.com/frand"
 )
 
-const (
-	PartitionSelectionMax int64 = 35
+var (
+	PartitionSelectionMax int64 = 100
 	PartitionPeekMax      int64 = PartitionSelectionMax * 3
+)
+
+const (
 
 	// PartitionLeaseDuration dictates how long a worker holds the lease for
 	// a partition.  This gives the worker a right to scan all queue items
@@ -50,11 +56,10 @@ const (
 	//
 	// This means that jobs not started because of concurrency limits incur up to this amount
 	// of additional latency.
-	PartitionConcurrencyLimitRequeueExtension = time.Second * 2
+	PartitionConcurrencyLimitRequeueExtension = time.Second
 
-	QueueSelectionMax   int64 = 50
 	QueuePeekMax        int64 = 1000
-	QueuePeekDefault    int64 = QueueSelectionMax * 3
+	QueuePeekDefault    int64 = 200
 	QueueLeaseDuration        = 10 * time.Second
 	ConfigLeaseDuration       = 10 * time.Second
 	ConfigLeaseMax            = 20 * time.Second
@@ -64,7 +69,7 @@ const (
 	PriorityMin     uint = 9
 
 	// FunctionStartScoreBufferTime is the grace period used to compare function start
-	// times to edg enqueue times.
+	// times to edge enqueue times.
 	FunctionStartScoreBufferTime = 10 * time.Second
 
 	defaultNumWorkers           = 100
@@ -90,7 +95,13 @@ var (
 	ErrConfigAlreadyLeased           = fmt.Errorf("config scanner already leased")
 	ErrConfigLeaseExceedsLimits      = fmt.Errorf("config lease duration exceeds the maximum of %d seconds", int(ConfigLeaseMax.Seconds()))
 	ErrPartitionConcurrencyLimit     = fmt.Errorf("At partition concurrency limit")
-	ErrConcurrencyLimit              = fmt.Errorf("At concurrency limit")
+	ErrAccountConcurrencyLimit       = fmt.Errorf("At account concurrency limit")
+
+	// ErrConcurrencyLimitCustomKeyN represents a concurrency limit being hit for *some*, but *not all*
+	// jobs in a queue, via custom concurrency keys which are evaluated to a specific string.
+
+	ErrConcurrencyLimitCustomKey0 = fmt.Errorf("At concurrency limit 0")
+	ErrConcurrencyLimitCustomKey1 = fmt.Errorf("At concurrency limit 1")
 )
 
 var (
@@ -102,6 +113,14 @@ func init() {
 	rnd = &frandRNG{RNG: frand.New(), lock: &sync.Mutex{}}
 }
 
+type QueueManager interface {
+	osqueue.JobQueueReader
+	osqueue.Queue
+
+	Requeue(ctx context.Context, p QueuePartition, i QueueItem, at time.Time) error
+	RequeueByJobID(ctx context.Context, partitionName string, jobID string, at time.Time) error
+}
+
 // PriorityFinder returns the priority for a given queue item.
 type PriorityFinder func(ctx context.Context, item QueueItem) uint
 
@@ -110,6 +129,12 @@ type QueueOpt func(q *queue)
 func WithName(name string) func(q *queue) {
 	return func(q *queue) {
 		q.name = name
+	}
+}
+
+func WithQueueLifecycles(l ...QueueLifecycleListener) func(q *queue) {
+	return func(q *queue) {
+		q.lifecycles = l
 	}
 }
 
@@ -165,6 +190,12 @@ func WithTracer(t trace.Tracer) func(q *queue) {
 	}
 }
 
+func WithQueueItemIndexer(i QueueItemIndexer) func(q *queue) {
+	return func(q *queue) {
+		q.itemIndexer = i
+	}
+}
+
 // WithDenyQueueNames specifies that the worker cannot select jobs from queue partitions
 // within the given list of names.  This means that the worker will never work on jobs
 // in the specified queues.
@@ -175,8 +206,33 @@ func WithDenyQueueNames(queues ...string) func(q *queue) {
 	return func(q *queue) {
 		q.denyQueues = queues
 		q.denyQueueMap = make(map[string]*struct{})
+		q.denyQueuePrefixes = make(map[string]*struct{})
 		for _, i := range queues {
 			q.denyQueueMap[i] = &struct{}{}
+			// If WithDenyQueueNames includes "user:*", trim the asterisc and use
+			// this as a prefix match.
+			if strings.HasSuffix(i, "*") {
+				q.denyQueuePrefixes[strings.TrimSuffix(i, "*")] = &struct{}{}
+			}
+		}
+	}
+}
+
+// WithAllowQueueNames specifies that the worker can only select jobs from queue partitions
+// within the given list of names.  This means that the worker will never work on jobs in
+// other queues.
+func WithAllowQueueNames(queues ...string) func(q *queue) {
+	return func(q *queue) {
+		q.allowQueues = queues
+		q.allowQueueMap = make(map[string]*struct{})
+		q.allowQueuePrefixes = make(map[string]*struct{})
+		for _, i := range queues {
+			q.allowQueueMap[i] = &struct{}{}
+			// If WithAllowQueueNames includes "user:*", trim the asterisc and use
+			// this as a prefix match.
+			if strings.HasSuffix(i, "*") {
+				q.allowQueuePrefixes[strings.TrimSuffix(i, "*")] = &struct{}{}
+			}
 		}
 	}
 }
@@ -218,15 +274,15 @@ func WithPartitionConcurrencyKeyGenerator(f PartitionConcurrencyKeyGenerator) fu
 	}
 }
 
-func WithAccountConcurrencyKeyGenerator(f QueueItemConcurrencyKeyGenerator) func(q *queue) {
+func WithAccountConcurrencyKeyGenerator(f AccountConcurrencyKeyGenerator) func(q *queue) {
 	return func(q *queue) {
 		q.accountConcurrencyGen = f
 	}
 }
 
-func WithConcurrencyService(s concurrency.ConcurrencyService) func(q *queue) {
+func WithBackoffFunc(f backoff.BackoffFunc) func(q *queue) {
 	return func(q *queue) {
-		q.concurrencyService = s
+		q.backoffFunc = f
 	}
 }
 
@@ -235,7 +291,11 @@ func WithConcurrencyService(s concurrency.ConcurrencyService) func(q *queue) {
 // Each queue item can have its own concurrency keys.  For example, you can define
 // concurrency limits for steps within a function.  This ensures that there will never be
 // more than N concurrent items running at once.
-type QueueItemConcurrencyKeyGenerator func(ctx context.Context, i QueueItem) (string, int)
+type QueueItemConcurrencyKeyGenerator func(ctx context.Context, i QueueItem) []state.CustomConcurrency
+
+// AccountConcurrencyKeyGenerator returns a concurrency key given the queue item's account
+// identifier.
+type AccountConcurrencyKeyGenerator func(ctx context.Context, i QueueItem) (string, int)
 
 // PartitionConcurrencyKeyGenerator returns a concurrency key and limit for a given partition
 // (function).
@@ -263,6 +323,8 @@ func NewQueue(r rueidis.Client, opts ...QueueOpt) *queue {
 		partitionConcurrencyGen: func(ctx context.Context, p QueuePartition) (string, int) {
 			return p.Queue(), 10_000
 		},
+		itemIndexer: QueueItemIndexerFunc,
+		backoffFunc: backoff.DefaultBackoff,
 	}
 
 	for _, opt := range opts {
@@ -283,13 +345,11 @@ type queue struct {
 	pf PriorityFinder
 	kg QueueKeyGenerator
 
-	accountConcurrencyGen   QueueItemConcurrencyKeyGenerator
+	lifecycles []QueueLifecycleListener
+
+	accountConcurrencyGen   AccountConcurrencyKeyGenerator
 	partitionConcurrencyGen PartitionConcurrencyKeyGenerator
 	customConcurrencyGen    QueueItemConcurrencyKeyGenerator
-	// concurrencyService is an external concurrency limiter used when pulling
-	// jobs off of the queue.  It is only invoked for jobs with a non-zero function ID,
-	// eg. for jobs that run a function.
-	concurrencyService concurrency.ConcurrencyService
 
 	// idempotencyTTL is the default or static idempotency duration apply to jobs,
 	// if idempotencyTTLFunc is not defined.
@@ -318,10 +378,21 @@ type queue struct {
 	queueKindMapping map[string]string
 	logger           *zerolog.Logger
 
+	// itemIndexer returns indexes for a given queue item.
+	itemIndexer QueueItemIndexer
+
 	// denyQueues provides a denylist ensuring that the queue will never claim
 	// this partition, meaning that no jobs from this queue will run on this worker.
-	denyQueues   []string
-	denyQueueMap map[string]*struct{}
+	denyQueues        []string
+	denyQueueMap      map[string]*struct{}
+	denyQueuePrefixes map[string]*struct{}
+
+	// allowQueues provides an allowlist, ensuring that the queue only peeks the specified
+	// partitions.  jobs from other partitions will never be scanned or processed.
+	allowQueues   []string
+	allowQueueMap map[string]*struct{}
+	// allowQueuePrefixes are memoized prefixes that can be allowed.
+	allowQueuePrefixes map[string]*struct{}
 
 	// seqLeaseID stores the lease ID if this queue is the sequential processor.
 	// all runners attempt to claim this lease automatically.
@@ -341,6 +412,8 @@ type queue struct {
 	scope tally.Scope
 	// tracer is the tracer to use for opentelemetry tracing.
 	tracer trace.Tracer
+	// backoffFunc is the backoff function to use when retrying operations.
+	backoffFunc backoff.BackoffFunc
 }
 
 // processItem references the queue partition and queue item to be processed by a worker.
@@ -358,12 +431,28 @@ type QueueItem struct {
 	// unique string and will be hashed.  Using the same ID provides idempotency
 	// guarantees within the queue's IdempotencyTTL.
 	ID string `json:"id"`
-	// At represents the current time that this QueueItem needs to be executed at,
-	// as a millisecond epoch.  This is the millisecond-level granularity score of
-	// the item.  Note that the score in Redis is second-level, ie this field / 1000.
+	// EarliestPeekTime stores the earliest time that the job was peeked as a
+	// millisecond epoch timestamp.
+	//
+	// This lets us easily track sojourn latency.
+	EarliestPeekTime int64 `json:"pt"`
+	// AtMS represents the score for the queue item - usually, the current time
+	// that this QueueItem needs to be executed at, as a millisecond epoch.
+	//
+	// Note that due to priority factors and function FIFO manipulation, if we're
+	// scheduling a job to run at `Now()` AtMS may be a time in the past to bump
+	// the item in the queue.
 	//
 	// This is necessary for rescoring partitions and checking latencies.
 	AtMS int64 `json:"at"`
+
+	// WallTimeMS represents the actual wall time in which the job should run, used to
+	// check latencies.  This is NOT used for scoring or ordering and is for internal
+	// accounting only.
+	//
+	// This is set when enqueueing or requeueing a job.
+	WallTimeMS int64 `json:"wt"`
+
 	// WorkflowID is the workflow ID that this job belongs to.
 	WorkflowID uuid.UUID `json:"wfID"`
 	// WorkspaceID is the workspace that this job belongs to.
@@ -379,6 +468,15 @@ type QueueItem struct {
 	//
 	// This should almost always be nil.
 	QueueName *string `json:"queueID,omitempty"`
+	// IdempotencyPerioud allows customizing the idempotency period for this queue
+	// item.  For example, after a debounce queue has been consumed we want to remove
+	// the idempotency key immediately;  the same debounce key should become available
+	// for another debounced function run.
+	IdempotencyPeriod *time.Duration `json:"ip,omitempty"`
+}
+
+func (q *QueueItem) SetID(ctx context.Context, str string) {
+	q.ID = HashID(ctx, str)
 }
 
 // Score returns the score (time that the item should run) for the queue item.
@@ -391,24 +489,29 @@ type QueueItem struct {
 // We can ONLY do this for the first attempt, and we can ONLY do this for edges that
 // are not sleeps (eg. immediate runs)
 func (q QueueItem) Score() int64 {
-	// If this is not an edge, we can ignore this.
-	if q.Data.Kind != osqueue.KindEdge || q.Data.Attempt > 0 {
+	// If this is not a start/simple edge/edge error, we can ignore this.
+	if (q.Data.Kind != osqueue.KindStart &&
+		q.Data.Kind != osqueue.KindEdge &&
+		q.Data.Kind != osqueue.KindEdgeError) || q.Data.Attempt > 0 {
 		return q.AtMS
 	}
 
 	// If this is > 2 seconds in the future, don't mess with the time.
 	// This prevents any accidental fudging of future run times, even if the
 	// kind is edge (which should never exist... but, better to be safe).
-	if q.AtMS > time.Now().Add(2*time.Second).UnixMilli() {
+	if q.AtMS > time.Now().Add(consts.FutureAtLimit).UnixMilli() {
 		return q.AtMS
 	}
 
 	// Only fudge the numbers if the run is older than the buffer time.
 	startAt := int64(q.Data.Identifier.RunID.Time())
 	if q.AtMS-startAt > FunctionStartScoreBufferTime.Milliseconds() {
-		return startAt
+		// Remove the PriorityFactor from the time to push higher priority work
+		// earlier.
+		return startAt - q.Data.GetPriorityFactor()
 	}
-	return q.AtMS
+
+	return q.AtMS - q.Data.GetPriorityFactor()
 }
 
 func (q QueueItem) MarshalBinary() ([]byte, error) {
@@ -423,6 +526,12 @@ func (q QueueItem) Queue() string {
 		return q.WorkflowID.String()
 	}
 	return *q.QueueName
+}
+
+// IsLeased checks if the QueueItem is currently already leased or not
+// based on the time passed in.
+func (q QueueItem) IsLeased(time time.Time) bool {
+	return q.LeaseID != nil && ulid.Time(q.LeaseID.Time()).After(time)
 }
 
 // QueuePartition represents an individual queue for a workflow.  It stores the
@@ -443,11 +552,12 @@ type QueuePartition struct {
 	// level granularity here as queue partitions work to the nearest second.
 	AtS int64 `json:"at"`
 
-	// Last represents the time that this QueueItem was last leased, as a unix
-	// epoch.
+	// Last represents the time that this partition was last leased, as a millisecond
+	// unix epoch.  In essence, we need this to track how frequently we're leasing and
+	// attempting to run items in the partition's queue.
 	//
-	// This lets us inspect the time a QueuePartition was last leased, and figure
-	// out whether we should garbage collect the partition index.
+	// Without this, we cannot track sojourn latency.
+	// garbage collection when the queue remains empty.
 	Last int64 `json:"last"`
 
 	// LeaseID represents a lease on this partition.  If the LeaseID is not nil,
@@ -470,6 +580,106 @@ func (q QueuePartition) MarshalBinary() ([]byte, error) {
 	return json.Marshal(q)
 }
 
+func (q *queue) RunJobs(ctx context.Context, workspaceID, workflowID uuid.UUID, runID ulid.ULID, limit, offset int64) ([]osqueue.JobResponse, error) {
+	if limit > 10 || limit <= 0 {
+		limit = 10
+	}
+
+	cmd := q.r.B().Zscan().Key(q.kg.RunIndex(runID)).Cursor(uint64(offset)).Count(limit).Build()
+	jobIDs, err := q.r.Do(ctx, cmd).AsScanEntry()
+	if err != nil {
+		return nil, fmt.Errorf("error reading index: %w", err)
+	}
+
+	if len(jobIDs.Elements) == 0 {
+		return []osqueue.JobResponse{}, nil
+	}
+
+	// Get all job items.
+	jsonItems, err := q.r.Do(ctx, q.r.B().Hmget().Key(q.kg.QueueItem()).Field(jobIDs.Elements...).Build()).AsStrSlice()
+	if err != nil {
+		return nil, fmt.Errorf("error reading jobs: %w", err)
+	}
+
+	resp := []osqueue.JobResponse{}
+	for _, str := range jsonItems {
+		if len(str) == 0 {
+			continue
+		}
+		qi := &QueueItem{}
+
+		if err := json.Unmarshal([]byte(str), qi); err != nil {
+			return nil, fmt.Errorf("error unmarshalling queue item: %w", err)
+		}
+		if qi.Data.Identifier.WorkspaceID != workspaceID {
+			continue
+		}
+		cmd := q.r.B().Zrank().Key(q.kg.QueueIndex(workflowID.String())).Member(qi.ID).Build()
+		pos, err := q.r.Do(ctx, cmd).AsInt64()
+		if !rueidis.IsRedisNil(err) && err != nil {
+			return nil, fmt.Errorf("error reading queue position: %w", err)
+		}
+		resp = append(resp, osqueue.JobResponse{
+			At:       time.UnixMilli(qi.AtMS),
+			Position: pos,
+			Kind:     qi.Data.Kind,
+			Attempt:  qi.Data.Attempt,
+		})
+	}
+
+	return resp, nil
+}
+
+func (q *queue) OutstandingJobCount(ctx context.Context, workspaceID, workflowID uuid.UUID, runID ulid.ULID) (int, error) {
+	cmd := q.r.B().Zcard().Key(q.kg.RunIndex(runID)).Build()
+	count, err := q.r.Do(ctx, cmd).AsInt64()
+	if err != nil {
+		return 0, fmt.Errorf("error counting index cardinality: %w", err)
+	}
+	return int(count), nil
+}
+
+func (q *queue) StatusCount(ctx context.Context, workflowID uuid.UUID, status string) (int64, error) {
+	key := q.kg.Status(status, workflowID)
+	cmd := q.r.B().Zcount().Key(key).Min("-inf").Max("+inf").Build()
+	count, err := q.r.Do(ctx, cmd).AsInt64()
+	if err != nil {
+		return 0, fmt.Errorf("error inspecting function queue status: %w", err)
+	}
+	return count, nil
+}
+
+func (q *queue) RunningCount(ctx context.Context, workflowID uuid.UUID) (int64, error) {
+	// Load the partition for a given queue.  This allows us to generate the concurrency
+	// key properly via the given function.
+	//
+	// TODO: Remove the ability to change keys based off of initialized inputs.  It's more trouble than
+	// it's worth, and ends up meaning we have more queries to write (such as this) in order to load
+	// relevant data.
+	cmd := q.r.B().Hget().Key(q.kg.PartitionItem()).Field(workflowID.String()).Build()
+	enc, err := q.r.Do(ctx, cmd).AsBytes()
+	if rueidis.IsRedisNil(err) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, fmt.Errorf("error fetching partition: %w", err)
+	}
+	item := &QueuePartition{}
+	if err = json.Unmarshal(enc, item); err != nil {
+		return 0, fmt.Errorf("error reading partition item: %w", err)
+	}
+
+	// Fetch the concurrency via the partition concurrency name.
+	pk, _ := q.partitionConcurrencyGen(ctx, *item)
+	key := q.kg.Concurrency("p", pk)
+	cmd = q.r.B().Zcard().Key(key).Build()
+	count, err := q.r.Do(ctx, cmd).AsInt64()
+	if err != nil {
+		return 0, fmt.Errorf("error inspecting running job count: %w", err)
+	}
+	return count, nil
+}
+
 // EnqueueItem enqueues a QueueItem.  It creates a QueuePartition for the workspace
 // if a partition does not exist.
 //
@@ -478,15 +688,15 @@ func (q QueuePartition) MarshalBinary() ([]byte, error) {
 //
 // The queue score must be added in milliseconds to process sub-second items in order.
 func (q *queue) EnqueueItem(ctx context.Context, i QueueItem, at time.Time) (QueueItem, error) {
-	ctx, span := q.tracer.Start(ctx, "EnqueueItem")
-	defer span.End()
-
 	if len(i.ID) == 0 {
-		i.ID = ulid.MustNew(ulid.Now(), rnd).String()
+		i.SetID(ctx, ulid.MustNew(ulid.Now(), rnd).String())
+	} else {
+		// Hash the ID.
+		// TODO: What if this is already hashed?
+		i.ID = HashID(ctx, i.ID)
 	}
 
-	// Hash the ID.
-	i.ID = hashID(ctx, i.ID)
+	// TODO: If the length of ID >= max, error.
 
 	priority := PriorityMin
 	if q.pf != nil {
@@ -500,6 +710,15 @@ func (q *queue) EnqueueItem(ctx context.Context, i QueueItem, at time.Time) (Que
 		return i, ErrPriorityTooHigh
 	}
 
+	if i.WallTimeMS == 0 {
+		i.WallTimeMS = at.UnixMilli()
+	}
+
+	if at.Before(time.Now()) {
+		// Normalize to now to minimize latency.
+		i.WallTimeMS = time.Now().UnixMilli()
+	}
+
 	// Add the At timestamp, if not included.
 	if i.AtMS == 0 {
 		i.AtMS = at.UnixMilli()
@@ -507,6 +726,14 @@ func (q *queue) EnqueueItem(ctx context.Context, i QueueItem, at time.Time) (Que
 
 	if i.Data.JobID == nil {
 		i.Data.JobID = &i.ID
+	}
+
+	partitionTime := at
+	if at.Before(time.Now()) {
+		// We don't want to enqueue partitions (pointers to fns) before now.
+		// Doing so allows users to stay at the front of the queue for
+		// leases.
+		partitionTime = time.Now()
 	}
 
 	// Get the queue name from the queue item.  This allows utilization of
@@ -518,7 +745,7 @@ func (q *queue) EnqueueItem(ctx context.Context, i QueueItem, at time.Time) (Que
 		QueueName:  i.QueueName,
 		WorkflowID: i.WorkflowID,
 		Priority:   priority,
-		AtS:        at.Unix(),
+		AtS:        partitionTime.Unix(),
 	}
 
 	keys := []string{
@@ -529,6 +756,12 @@ func (q *queue) EnqueueItem(ctx context.Context, i QueueItem, at time.Time) (Que
 		q.kg.PartitionIndex(),  // Global partition queue
 		q.kg.Idempotency(i.ID),
 	}
+	// Append indexes
+	for _, idx := range q.itemIndexer(ctx, i, q.kg) {
+		if idx != "" {
+			keys = append(keys, idx)
+		}
+	}
 
 	args, err := StrSlice([]any{
 		i,
@@ -536,6 +769,7 @@ func (q *queue) EnqueueItem(ctx context.Context, i QueueItem, at time.Time) (Que
 		at.UnixMilli(),
 		qn,
 		qp,
+		partitionTime.Unix(),
 	})
 	if err != nil {
 		return i, err
@@ -566,9 +800,6 @@ func (q *queue) EnqueueItem(ctx context.Context, i QueueItem, at time.Time) (Que
 // If limit is -1, this will return the first unleased item - representing the next available item in the
 // queue.
 func (q *queue) Peek(ctx context.Context, queueName string, until time.Time, limit int64) ([]*QueueItem, error) {
-	ctx, span := q.tracer.Start(ctx, "Peek")
-	defer span.End()
-
 	// Check whether limit is -1, peeking next available time
 	isPeekNext := limit == -1
 
@@ -612,7 +843,7 @@ func (q *queue) Peek(ctx context.Context, queueName string, until time.Time, lim
 		if err := json.Unmarshal([]byte(str), qi); err != nil {
 			return nil, fmt.Errorf("error unmarshalling peeked queue item: %w", err)
 		}
-		if qi.LeaseID != nil && now.Before(ulid.Time(qi.LeaseID.Time())) {
+		if qi.IsLeased(now) {
 			// Leased item, don't return.
 			continue
 		}
@@ -629,28 +860,81 @@ func (q *queue) Peek(ctx context.Context, queueName string, until time.Time, lim
 	return result[0:n], nil
 }
 
+// RequeueByJobID requeues a job for a specific time given a partition name and job ID.
+//
+// If the queue item referenced by the job ID is not outstanding (ie. it has a lease, is in
+// progress, or doesn't exist) this returns an error.
+func (q *queue) RequeueByJobID(ctx context.Context, partitionName string, jobID string, at time.Time) error {
+	jobID = HashID(ctx, jobID)
+
+	keys := []string{
+		q.kg.QueueIndex(partitionName),
+		q.kg.QueueItem(),
+		q.kg.PartitionIndex(), // Global partition queue
+		q.kg.PartitionItem(),  // Partition hash
+	}
+	status, err := scripts["queue/requeueByID"].Exec(
+		ctx,
+		q.r,
+		keys,
+		[]string{
+			jobID,
+			strconv.Itoa(int(at.UnixMilli())),
+			partitionName,
+			strconv.Itoa(int(time.Now().UnixMilli())),
+		},
+	).AsInt64()
+	if err != nil {
+		return fmt.Errorf("error leasing queue item: %w", err)
+	}
+	switch status {
+	case 0:
+		return nil
+	case -1:
+		return ErrQueueItemNotFound
+	case -2:
+		return ErrQueueItemAlreadyLeased
+	default:
+		return fmt.Errorf("unknown requeue by id response: %d", status)
+	}
+
+}
+
 // Lease temporarily dequeues an item from the queue by obtaining a lease, preventing
 // other workers from working on this queue item at the same time.
 //
 // Obtaining a lease updates the vesting time for the queue item until now() +
 // lease duration. This returns the newly acquired lease ID on success.
 func (q *queue) Lease(ctx context.Context, p QueuePartition, item QueueItem, duration time.Duration) (*ulid.ULID, error) {
-	ctx, span := q.tracer.Start(ctx, "Lease")
-	defer span.End()
-
 	var (
-		ak, pk, ck string // account, partition, custom concurrency key
-		ac, pc, cc int    // account, partiiton, custom concurrency max
+		ak, pk string // account, partition concurrency key
+		ac, pc int    // account, partiiton concurrency max
+
+		customKeys   = make([]string, 2)
+		customLimits = make([]int, 2)
 	)
 
-	// required
+	// Required.
+	//
+	// This should be found by calling function.ConcurrencyLimit() to return
+	// the lowest concurrency limit available.  It limits the capacity of all
+	// runs for the given function.
 	pk, pc = q.partitionConcurrencyGen(ctx, p)
+
 	// optional
 	if q.accountConcurrencyGen != nil {
 		ak, ac = q.accountConcurrencyGen(ctx, item)
 	}
 	if q.customConcurrencyGen != nil {
-		ck, cc = q.customConcurrencyGen(ctx, item) // Get the custom concurrency key, if available.
+		// Get the custom concurrency key, if available.
+		for i, item := range q.customConcurrencyGen(ctx, item) {
+			if i >= 2 {
+				// We only support two concurrency keys right now.
+				break
+			}
+			customKeys[i] = item.Key
+			customLimits[i] = item.Limit
+		}
 	}
 
 	leaseID, err := ulid.New(ulid.Timestamp(time.Now().Add(duration).UTC()), rnd)
@@ -664,7 +948,10 @@ func (q *queue) Lease(ctx context.Context, p QueuePartition, item QueueItem, dur
 		q.kg.PartitionMeta(item.Queue()),
 		q.kg.Concurrency("account", ak),
 		q.kg.Concurrency("p", pk),
-		q.kg.Concurrency("custom", ck),
+
+		q.kg.Concurrency("custom", customKeys[0]),
+		q.kg.Concurrency("custom", customKeys[1]),
+
 		q.kg.ConcurrencyIndex(),
 	}
 	args, err := StrSlice([]any{
@@ -673,7 +960,8 @@ func (q *queue) Lease(ctx context.Context, p QueuePartition, item QueueItem, dur
 		time.Now().UnixMilli(),
 		ac,
 		pc,
-		cc,
+		customLimits[0],
+		customLimits[1],
 		p.Queue(),
 	})
 	if err != nil {
@@ -696,10 +984,24 @@ func (q *queue) Lease(ctx context.Context, p QueuePartition, item QueueItem, dur
 	case 2:
 		return nil, ErrQueueItemAlreadyLeased
 	case 3:
-		return nil, ErrConcurrencyLimit
+		// fn limit relevant to all runs in the fn
+		return nil, ErrPartitionConcurrencyLimit
+	case 4:
+		return nil, ErrAccountConcurrencyLimit
+	case 5:
+		return nil, ErrConcurrencyLimitCustomKey0
+	case 6:
+		return nil, ErrConcurrencyLimitCustomKey1
 	default:
 		return nil, fmt.Errorf("unknown response enqueueing item: %d", status)
 	}
+}
+
+func isConcurrencyLimitError(err error) bool {
+	return err == ErrPartitionConcurrencyLimit ||
+		err == ErrAccountConcurrencyLimit ||
+		err == ErrConcurrencyLimitCustomKey0 ||
+		err == ErrConcurrencyLimitCustomKey1
 }
 
 // ExtendLease extens the lease for a given queue item, given the queue item is currently
@@ -711,11 +1013,9 @@ func (q *queue) Lease(ctx context.Context, p QueuePartition, item QueueItem, dur
 // Renewing a lease updates the vesting time for the queue item until now() +
 // lease duration. This returns the newly acquired lease ID on success.
 func (q *queue) ExtendLease(ctx context.Context, p QueuePartition, i QueueItem, leaseID ulid.ULID, duration time.Duration) (*ulid.ULID, error) {
-	ctx, span := q.tracer.Start(ctx, "ExtendLease")
-	defer span.End()
-
 	var (
-		ak, pk, ck string // account, partition, custom concurrency key
+		ak, pk     string // account, partition, custom concurrency key
+		customKeys = make([]string, 2)
 	)
 	// required
 	pk, _ = q.partitionConcurrencyGen(ctx, p)
@@ -724,7 +1024,14 @@ func (q *queue) ExtendLease(ctx context.Context, p QueuePartition, i QueueItem, 
 		ak, _ = q.accountConcurrencyGen(ctx, i)
 	}
 	if q.customConcurrencyGen != nil {
-		ck, _ = q.customConcurrencyGen(ctx, i)
+		// Get the custom concurrency key, if available.
+		for n, item := range q.customConcurrencyGen(ctx, i) {
+			if n >= 2 {
+				// We only support two concurrency keys right now.
+				break
+			}
+			customKeys[n] = item.Key
+		}
 	}
 
 	newLeaseID, err := ulid.New(ulid.Timestamp(time.Now().Add(duration).UTC()), rnd)
@@ -738,7 +1045,8 @@ func (q *queue) ExtendLease(ctx context.Context, p QueuePartition, i QueueItem, 
 		q.kg.PartitionIndex(),
 		q.kg.Concurrency("account", ak),
 		q.kg.Concurrency("p", pk),
-		q.kg.Concurrency("custom", ck),
+		q.kg.Concurrency("custom", customKeys[0]),
+		q.kg.Concurrency("custom", customKeys[1]),
 	}
 
 	args, err := StrSlice([]any{
@@ -776,7 +1084,8 @@ func (q *queue) ExtendLease(ctx context.Context, p QueuePartition, i QueueItem, 
 // Dequeue removes an item from the queue entirely.
 func (q *queue) Dequeue(ctx context.Context, p QueuePartition, i QueueItem) error {
 	var (
-		ak, pk, ck string // account, partition, custom concurrency key
+		ak, pk     string // account, partition, custom concurrency key
+		customKeys = make([]string, 2)
 	)
 	// required
 	pk, _ = q.partitionConcurrencyGen(ctx, p)
@@ -785,7 +1094,14 @@ func (q *queue) Dequeue(ctx context.Context, p QueuePartition, i QueueItem) erro
 		ak, _ = q.accountConcurrencyGen(ctx, i)
 	}
 	if q.customConcurrencyGen != nil {
-		ck, _ = q.customConcurrencyGen(ctx, i)
+		// Get the custom concurrency key, if available.
+		for n, item := range q.customConcurrencyGen(ctx, i) {
+			if n >= 2 {
+				// We only support two concurrency keys right now.
+				break
+			}
+			customKeys[n] = item.Key
+		}
 	}
 
 	qn := i.Queue()
@@ -796,8 +1112,15 @@ func (q *queue) Dequeue(ctx context.Context, p QueuePartition, i QueueItem) erro
 		q.kg.Idempotency(i.ID),
 		q.kg.Concurrency("account", ak),
 		q.kg.Concurrency("p", pk),
-		q.kg.Concurrency("custom", ck),
+		q.kg.Concurrency("custom", customKeys[0]),
+		q.kg.Concurrency("custom", customKeys[1]),
 		q.kg.ConcurrencyIndex(),
+	}
+	// Append indexes
+	for _, idx := range q.itemIndexer(ctx, i, q.kg) {
+		if idx != "" {
+			keys = append(keys, idx)
+		}
 	}
 
 	idempotency := q.idempotencyTTL
@@ -834,9 +1157,6 @@ func (q *queue) Dequeue(ctx context.Context, p QueuePartition, i QueueItem) erro
 
 // Requeue requeues an item in the future.
 func (q *queue) Requeue(ctx context.Context, p QueuePartition, i QueueItem, at time.Time) error {
-	ctx, span := q.tracer.Start(ctx, "Requeue")
-	defer span.End()
-
 	priority := PriorityMin
 	if q.pf != nil {
 		priority = q.pf(ctx, i)
@@ -847,7 +1167,8 @@ func (q *queue) Requeue(ctx context.Context, p QueuePartition, i QueueItem, at t
 	}
 
 	var (
-		ak, pk, ck string // account, partition, custom concurrency key
+		ak, pk     string // account, partition, custom concurrency key
+		customKeys = make([]string, 2)
 	)
 
 	// required
@@ -857,13 +1178,24 @@ func (q *queue) Requeue(ctx context.Context, p QueuePartition, i QueueItem, at t
 		ak, _ = q.accountConcurrencyGen(ctx, i)
 	}
 	if q.customConcurrencyGen != nil {
-		ck, _ = q.customConcurrencyGen(ctx, i) // Get the custom concurrency key, if available.
+		// Get the custom concurrency key, if available.
+		for n, item := range q.customConcurrencyGen(ctx, i) {
+			if n >= 2 {
+				// We only support two concurrency keys right now.
+				break
+			}
+			customKeys[n] = item.Key
+		}
 	}
 
 	// Unset any lease ID as this is requeued.
 	i.LeaseID = nil
 	// Update the At timestamp.
+	// NOTE: This does no priority factorization or FIFO for function ordering,
+	// eg. adjusting AtMS based off of function run time.
 	i.AtMS = at.UnixMilli()
+	// Update the wall time that this should run at.
+	i.WallTimeMS = at.UnixMilli()
 
 	qn := i.Queue()
 
@@ -880,8 +1212,15 @@ func (q *queue) Requeue(ctx context.Context, p QueuePartition, i QueueItem, at t
 		q.kg.PartitionIndex(),
 		q.kg.Concurrency("account", ak),
 		q.kg.Concurrency("p", pk),
-		q.kg.Concurrency("custom", ck),
+		q.kg.Concurrency("custom", customKeys[0]),
+		q.kg.Concurrency("custom", customKeys[1]),
 		q.kg.ConcurrencyIndex(),
+	}
+	// Append indexes
+	for _, idx := range q.itemIndexer(ctx, i, q.kg) {
+		if idx != "" {
+			keys = append(keys, idx)
+		}
 	}
 
 	args, err := StrSlice([]any{
@@ -916,16 +1255,13 @@ func (q *queue) Requeue(ctx context.Context, p QueuePartition, i QueueItem, at t
 // NOTE: This does not check the queue/partition name against allow or denylists;  it assumes
 // that the worker always wants to lease the given queue.  Filtering must be done when peeking
 // when running a worker.
-func (q *queue) PartitionLease(ctx context.Context, p QueuePartition, duration time.Duration) (*ulid.ULID, int64, error) {
-	ctx, span := q.tracer.Start(ctx, "PartitionLease")
-	defer span.End()
-
+func (q *queue) PartitionLease(ctx context.Context, p *QueuePartition, duration time.Duration) (*ulid.ULID, error) {
 	var (
 		concurrencyKey string
 		concurrency    = defaultPartitionConcurrency
 	)
 	if q.partitionConcurrencyGen != nil {
-		concurrencyKey, concurrency = q.partitionConcurrencyGen(ctx, p)
+		concurrencyKey, concurrency = q.partitionConcurrencyGen(ctx, *p)
 	}
 
 	// XXX: Check for function throttling prior to leasing;  if it's throttled we can requeue
@@ -935,7 +1271,7 @@ func (q *queue) PartitionLease(ctx context.Context, p QueuePartition, duration t
 	leaseExpires := now.Add(duration).UTC().Truncate(time.Millisecond)
 	leaseID, err := ulid.New(ulid.Timestamp(leaseExpires), rnd)
 	if err != nil {
-		return nil, 0, fmt.Errorf("error generating id: %w", err)
+		return nil, fmt.Errorf("error generating id: %w", err)
 	}
 
 	keys := []string{
@@ -952,7 +1288,7 @@ func (q *queue) PartitionLease(ctx context.Context, p QueuePartition, duration t
 		concurrency,
 	})
 	if err != nil {
-		return nil, 0, err
+		return nil, err
 	}
 	result, err := scripts["queue/partitionLease"].Exec(
 		ctx,
@@ -963,30 +1299,30 @@ func (q *queue) PartitionLease(ctx context.Context, p QueuePartition, duration t
 
 	).AsInt64()
 	if err != nil {
-		return nil, 0, fmt.Errorf("error leasing partition: %w", err)
+		return nil, fmt.Errorf("error leasing partition: %w", err)
 	}
 	switch result {
 	case -1:
-		return nil, 0, ErrPartitionConcurrencyLimit
+		return nil, ErrPartitionConcurrencyLimit
 	case -2:
-		return nil, 0, ErrPartitionNotFound
+		return nil, ErrPartitionNotFound
 	case -3:
-		return nil, 0, ErrPartitionAlreadyLeased
+		return nil, ErrPartitionAlreadyLeased
 	default:
+		// Update the partition's last indicator.
+		if result > p.Last {
+			p.Last = result
+		}
+
 		// If there's no concurrency limit for this partition, return a default
 		// amount so that processing the partition has reasonable limits.
 		if concurrency == 0 {
-			return &leaseID, QueuePeekDefault, nil
+			return &leaseID, nil
 		}
 
 		// result is the available concurrency within this partition
-		return &leaseID, result, nil
+		return &leaseID, nil
 	}
-}
-
-func (q *queue) PartitionLeaseByID(ctx context.Context, id string, duration time.Duration) (*ulid.ULID, int64, error) {
-	// Fetch the partition.
-	return nil, 0, nil
 }
 
 // PartitionPeek returns up to PartitionSelectionMax partition items from the queue. This
@@ -1004,9 +1340,9 @@ func (q *queue) PartitionPeek(ctx context.Context, sequential bool, until time.T
 		limit = PartitionPeekMax
 	}
 
-	// TODO: If this is an allowlist, only peek the given partitions.
-	//       This requires ZMSCORE support within miniredis for testing;  we need
-	//       to add this prior to implementation.
+	// TODO: If this is an allowlist, only peek the given partitions.  Use ZMSCORE
+	// to fetch the scores for all allowed partitions, then filter where score <= until.
+	// Call an HMGET to get the partitions.
 
 	unix := until.Unix()
 
@@ -1046,11 +1382,19 @@ func (q *queue) PartitionPeek(ctx context.Context, sequential bool, until time.T
 			return nil, fmt.Errorf("error reading partition item: %w", err)
 		}
 
+		// If we have an allowlist, only accept this partition if its in the allowlist.
+		if len(q.allowQueues) > 0 && !checkList(item.Queue(), q.allowQueueMap, q.allowQueuePrefixes) {
+			// This is not in the allowlist specified, so do not allow this partition to be used.
+			ignored++
+			continue
+		}
+
 		// Ignore any denied queues if they're explicitly in the denylist.  Because
 		// we allocate the len(encoded) amount, we also want to track the number of
 		// ignored queues to use the correct index when setting our items;  this ensures
 		// that we don't access items with an index and get nil pointers.
-		if len(q.denyQueues) > 0 && q.denyQueueMap[item.Queue()] != nil {
+		if len(q.denyQueues) > 0 && checkList(item.Queue(), q.denyQueueMap, q.denyQueuePrefixes) {
+			// This is in the denylist explicitly set, so continue
 			ignored++
 			continue
 		}
@@ -1086,6 +1430,20 @@ func (q *queue) PartitionPeek(ctx context.Context, sequential bool, until time.T
 	return result, nil
 }
 
+func checkList(check string, exact, prefixes map[string]*struct{}) bool {
+	for k := range exact {
+		if check == k {
+			return true
+		}
+	}
+	for k := range prefixes {
+		if strings.HasPrefix(check, k) {
+			return true
+		}
+	}
+	return false
+}
+
 // PartitionRequeue requeues a parition with a new score, ensuring that the partition will be
 // read at (or very close to) the given time.
 //
@@ -1096,9 +1454,6 @@ func (q *queue) PartitionPeek(ctx context.Context, sequential bool, until time.T
 // concurrency limit;  we don't want to scan the partition next time, so we force the partition
 // to be at a specific time instead of taking the earliest available queue item time
 func (q *queue) PartitionRequeue(ctx context.Context, queueName string, at time.Time, forceAt bool) error {
-	ctx, span := q.tracer.Start(ctx, "PartitionRequeue")
-	defer span.End()
-
 	keys := []string{
 		q.kg.PartitionItem(),
 		q.kg.PartitionIndex(),
@@ -1282,10 +1637,10 @@ func (q *queue) Scavenge(ctx context.Context) (int, error) {
 // ConfigLease allows a worker to lease config keys for sequential or scavenger processing.
 // Leasing this key works similar to leasing partitions or queue items:
 //
-// - If the key isn't leased, a new lease is accepted.
-// - If the lease is expired, a new lease is accepted.
-// - If the key is leased, you must pass in the existing lease ID to renew the lease.  Mismatches do not
-//   grant a lease.
+//   - If the key isn't leased, a new lease is accepted.
+//   - If the lease is expired, a new lease is accepted.
+//   - If the key is leased, you must pass in the existing lease ID to renew the lease.  Mismatches do not
+//     grant a lease.
 //
 // This returns the new lease ID on success.
 //
@@ -1334,7 +1689,7 @@ func (q *queue) ConfigLease(ctx context.Context, key string, duration time.Durat
 	}
 }
 
-func hashID(ctx context.Context, id string) string {
+func HashID(ctx context.Context, id string) string {
 	ui := xxhash.Sum64String(id)
 	return strconv.FormatUint(ui, 36)
 }

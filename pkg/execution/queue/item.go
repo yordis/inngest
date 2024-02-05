@@ -12,9 +12,14 @@ import (
 )
 
 const (
-	KindEdge  = "edge"
-	KindSleep = "sleep"
-	KindPause = "pause"
+	// KindStart represents a queue state that the function state has been created but not started yet.
+	// Essentially a status that represents the backlog.
+	KindStart     = "start"
+	KindEdge      = "edge"
+	KindSleep     = "sleep"
+	KindPause     = "pause"
+	KindDebounce  = "debounce"
+	KindEdgeError = "edge-error" // KindEdgeError is used to indicate a final step error attempting a graceful save.
 )
 
 type jobIDValType struct{}
@@ -63,6 +68,34 @@ type Item struct {
 	// Payload stores item-specific data for use when processing the item.  For example,
 	// this may contain the function's edge for running a step.
 	Payload any `json:"payload,omitempty"`
+	// Metadata is used for storing additional metadata related to the queue item.
+	// e.g. tracing data
+	Metadata map[string]string `json:"metadata,omitempty"`
+	// QueueName allows control over the queue name.  If not provided, this falls
+	// back to the queue mapping defined on the queue or the workflow ID of the fn.
+	QueueName *string `json:"qn,omitempty"`
+}
+
+// GetPriorityFactor returns the priority factor for the queue item.  This fudges the job item's
+// visibility time on enqueue, allowing fair prioritization.
+//
+// For example, a job with a PriorityFactor of 100 will be inserted 100 seconds prior to the job's
+// actual RunAt time.  This pushes the job ahead of other work, except for work older than 100 seconds.
+//
+// Therefore, when two jobs are enqueued at the same time with differeng factors the job with the higher
+// factor will always run first (without a queue backlog).
+//
+// Note: the returned time is the factor in milliseconds.
+func (i Item) GetPriorityFactor() int64 {
+	switch i.Kind {
+	case KindStart, KindEdge, KindEdgeError:
+		// Only support edges right now.  We don't account for the factor on other queue entries,
+		// else eg. sleeps would wake up at the wrong time.
+		if i.Identifier.PriorityFactor != nil {
+			return int64(*i.Identifier.PriorityFactor * 1000)
+		}
+	}
+	return 0
 }
 
 func (i Item) GetMaxAttempts() int {
@@ -72,15 +105,21 @@ func (i Item) GetMaxAttempts() int {
 	return *i.MaxAttempts
 }
 
+// IsStepKind determines if the item is considered a step
+func (i Item) IsStepKind() bool {
+	return i.Kind == KindStart || i.Kind == KindEdge || i.Kind == KindSleep || i.Kind == KindEdgeError
+}
+
 func (i *Item) UnmarshalJSON(b []byte) error {
 	type kind struct {
-		GroupID     string           `json:"groupID"`
-		WorkspaceID uuid.UUID        `json:"wsID"`
-		Kind        string           `json:"kind"`
-		Identifier  state.Identifier `json:"identifier"`
-		Attempt     int              `json:"atts"`
-		MaxAttempts *int             `json:"maxAtts,omitempty"`
-		Payload     json.RawMessage  `json:"payload"`
+		GroupID     string            `json:"groupID"`
+		WorkspaceID uuid.UUID         `json:"wsID"`
+		Kind        string            `json:"kind"`
+		Identifier  state.Identifier  `json:"identifier"`
+		Attempt     int               `json:"atts"`
+		MaxAttempts *int              `json:"maxAtts,omitempty"`
+		Payload     json.RawMessage   `json:"payload"`
+		Metadata    map[string]string `json:"metadata"`
 	}
 	temp := &kind{}
 	err := json.Unmarshal(b, temp)
@@ -94,6 +133,7 @@ func (i *Item) UnmarshalJSON(b []byte) error {
 	i.Identifier = temp.Identifier
 	i.Attempt = temp.Attempt
 	i.MaxAttempts = temp.MaxAttempts
+	i.Metadata = temp.Metadata
 	// Save this for custom unmarshalling of other jobs.  This is overwritten
 	// for known queue kinds.
 	if len(temp.Payload) > 0 {
@@ -101,7 +141,7 @@ func (i *Item) UnmarshalJSON(b []byte) error {
 	}
 
 	switch temp.Kind {
-	case KindEdge, KindSleep:
+	case KindStart, KindEdge, KindSleep, KindEdgeError:
 		// Edge and Sleep are the same;  the only difference is that the executor
 		// runner should always save nil to the state store using the outgoing edge's
 		// ID when processing a sleep so that the state + stack are updated properly.

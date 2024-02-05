@@ -2,40 +2,28 @@ package devserver
 
 import (
 	"context"
-	"embed"
+	"database/sql"
 	_ "embed"
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/fs"
-	"mime"
 	"net/http"
 	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
 	"github.com/inngest/inngest/pkg/api/tel"
+	"github.com/inngest/inngest/pkg/cqrs"
+	"github.com/inngest/inngest/pkg/headers"
 	"github.com/inngest/inngest/pkg/inngest"
 	"github.com/inngest/inngest/pkg/inngest/version"
 	"github.com/inngest/inngest/pkg/logger"
+	"github.com/inngest/inngest/pkg/publicerr"
 	"github.com/inngest/inngest/pkg/sdk"
+	"github.com/inngest/inngest/pkg/util"
 )
-
-//go:embed static/index.html
-var uiHtml []byte
-
-//go:embed static/assets
-var static embed.FS
-
-var (
-	// signingKeyErrorLoggedCount ensures that we log the signing key message once
-	// every N times, instead of spamming the console every time we poll for functions.
-	signingKeyErrorCount = 0
-)
-
-func init() {
-	// Fix invalid mime type errors when loading JS from our assets on windows.
-	_ = mime.AddExtensionType(".js", "application/javascript")
-}
 
 type devapi struct {
 	chi.Router
@@ -66,32 +54,67 @@ func (a *devapi) addRoutes() {
 		}
 		return http.HandlerFunc(fn)
 	})
+	a.Use(headers.StaticHeadersMiddleware(headers.ServerKindDev))
 
-	a.Get("/", a.UI)
-
-	// Go embeds files relative to the current source, which embeds
-	// all assets under ./static/assets.  We remove the ./static
-	// directory by using fs.Sub: https://pkg.go.dev/io/fs#Sub.
-	assetsFS, _ := fs.Sub(static, "static")
-	a.Get("/assets/*", http.FileServer(http.FS(assetsFS)).ServeHTTP)
 	a.Get("/dev", a.Info)
 	a.Post("/fn/register", a.Register)
+	// This allows tests to remove apps by URL
+	a.Delete("/fn/remove", a.RemoveApp)
+
+	// Go embeds files relative to the current source, which embeds
+	// all under ./static.  We remove the ./static
+	// directory by using fs.Sub: https://pkg.go.dev/io/fs#Sub.
+	staticFS, _ := fs.Sub(static, "static")
+	a.Get("/images/*", http.FileServer(http.FS(staticFS)).ServeHTTP)
+	a.Get("/assets/*", http.FileServer(http.FS(staticFS)).ServeHTTP)
+	a.Get("/_next/*", http.FileServer(http.FS(staticFS)).ServeHTTP)
+	a.Get("/{file}.txt", http.FileServer(http.FS(staticFS)).ServeHTTP)
+	a.Get("/{file}.svg", http.FileServer(http.FS(staticFS)).ServeHTTP)
+	a.Get("/{file}.jpg", http.FileServer(http.FS(staticFS)).ServeHTTP)
+	a.Get("/{file}.png", http.FileServer(http.FS(staticFS)).ServeHTTP)
+	// Everything else loads the UI.
+	a.NotFound(a.UI)
 }
 
 func (a devapi) UI(w http.ResponseWriter, r *http.Request) {
+	// If there's a file that exists within `static` for this particular route,
+	// return it as a static asset.
+	path := r.URL.Path
+	if f, err := static.Open("static" + path); err == nil {
+		if stat, err := f.Stat(); err == nil && !stat.IsDir() {
+			_, _ = io.Copy(w, f)
+			return
+		}
+	}
+
+	// If there's a trailing slash, redirect to non-trailing slashes.
+	if strings.HasSuffix(r.URL.Path, "/") && r.URL.Path != "/" {
+		r.URL.Path = strings.TrimSuffix(r.URL.Path, "/")
+		http.Redirect(w, r, r.URL.String(), 303)
+		return
+	}
+
 	m := tel.NewMetadata(r.Context())
 	tel.SendEvent(r.Context(), "cli/dev_ui.loaded", m)
 	tel.SendMetadata(r.Context(), m)
-	_, _ = w.Write(uiHtml)
+
+	byt := parsedRoutes.serve(r.Context(), r.URL.Path)
+	_, _ = w.Write(byt)
 }
 
 // Info returns information about the dev server and its registered functions.
 func (a devapi) Info(w http.ResponseWriter, r *http.Request) {
 	a.devserver.handlerLock.Lock()
-
 	defer a.devserver.handlerLock.Unlock()
 
-	funcs, _ := a.devserver.loader.Functions(r.Context())
+	all, _ := a.devserver.data.GetFunctions(r.Context())
+	funcs := make([]inngest.Function, len(all))
+	for n, i := range all {
+		f := inngest.Function{}
+		_ = json.Unmarshal([]byte(i.Config), &f)
+		funcs[n] = f
+	}
+
 	ir := InfoResponse{
 		Version:   version.Print(),
 		StartOpts: a.devserver.opts,
@@ -105,10 +128,18 @@ func (a devapi) Info(w http.ResponseWriter, r *http.Request) {
 
 // Register regsters functions served via SDKs
 func (a devapi) Register(w http.ResponseWriter, r *http.Request) {
+	defer r.Body.Close()
+	ctx := r.Context()
+
+	expectedServerKind := r.Header.Get(headers.HeaderKeyExpectedServerKind)
+	if expectedServerKind != "" && expectedServerKind != headers.ServerKindDev {
+		a.err(ctx, w, 400, fmt.Errorf("Expected server kind %s, got %s", expectedServerKind, headers.ServerKindDev))
+		return
+	}
+
 	a.devserver.handlerLock.Lock()
 	defer a.devserver.handlerLock.Unlock()
 
-	ctx := r.Context()
 	req := &sdk.RegisterRequest{}
 	if err := json.NewDecoder(r.Body).Decode(req); err != nil {
 		logger.From(ctx).Warn().Msgf("Invalid request:\n%s", err)
@@ -116,72 +147,10 @@ func (a devapi) Register(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var key string
-	bearer := r.Header.Get("Authorization")
-	if len(bearer) > 7 && strings.ToUpper(bearer[0:6]) == "BEARER" {
-		key = bearer[7:]
-	}
-	if key == "" {
-		// In development, we log a warning here.
-		if signingKeyErrorCount%20 == 0 {
-			logger.From(ctx).Warn().Msg("You're missing the INNGEST_SIGNING_KEY parameter when serving your functions.  This will not work in production.")
-		}
-		signingKeyErrorCount++
-	}
-
-	// XXX (tonyhb): If we're authenticated, we can match the signing key against the workspace's
-	// signing key and warn if the user has an invalid key.
-	funcs, err := req.Parse(ctx)
-	if err != nil {
-		logger.From(ctx).Warn().Msgf("At least one function is invalid:\n%s", err)
-		a.err(ctx, w, 400, fmt.Errorf("At least one function is invalid:\n%w", err))
+	if err := a.register(ctx, *req); err != nil {
+		logger.From(ctx).Warn().Msgf("Error registering functions:\n%s", err)
+		_ = publicerr.WriteHTTP(w, err)
 		return
-	}
-
-	// Find and update this SDK handler, if it exists.
-	var h *SDKHandler
-	for n, item := range a.devserver.handlers {
-		if item.SDK.URL != req.URL {
-			continue
-		}
-
-		// Check if the checksum exists and is the same.  If so, we can ignore
-		// this request.
-		/*
-			TODO: FIX THIS
-			if item.SDK.Hash != nil && req.Hash != nil && *item.SDK.Hash == *req.Hash {
-				_, _ = w.Write([]byte(`{"ok":true, "skipped": true}`))
-				return
-			}
-		*/
-
-		// Remove this item from the handlers list.
-		h = &item
-		a.devserver.handlers = append(a.devserver.handlers[:n], a.devserver.handlers[n+1:]...)
-		break
-	}
-
-	if h == nil {
-		h = &SDKHandler{
-			SDK:       *req,
-			CreatedAt: time.Now(),
-		}
-	}
-	// Reset function IDs;  we'll add these as we iterate through the requests.
-	h.Functions = []string{}
-	h.UpdatedAt = time.Now()
-
-	// For each function, add it to our loader.
-	for _, fn := range funcs {
-		// Create a new UUID for the function.
-		fn.ID = inngest.DeterministicUUID(*fn)
-
-		h.Functions = append(h.Functions, fn.Name)
-		if err := a.devserver.loader.AddFunction(ctx, fn); err != nil {
-			logger.From(ctx).Warn().Msgf("Error adding your function:\n%s", err)
-			a.err(ctx, w, 400, err)
-			return
-		}
 	}
 
 	// Re-initialize our cron manager.
@@ -191,16 +160,171 @@ func (a devapi) Register(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	a.devserver.handlers = append(a.devserver.handlers, *h)
 	_, _ = w.Write([]byte(`{"ok":true}`))
+}
 
-	logger.From(ctx).Info().
-		Int("len", len(req.Functions)).
-		Str("app", req.AppName).
-		Str("url", req.URL).
-		Str("sdk", req.SDK).
-		Str("framework", req.Framework).
-		Msg("registered functions")
+func (a devapi) register(ctx context.Context, r sdk.RegisterRequest) (err error) {
+	r.URL = util.NormalizeAppURL(r.URL)
+
+	sum, err := r.Checksum()
+	if err != nil {
+		return publicerr.Wrap(err, 400, "Invalid request")
+	}
+
+	if app, err := a.devserver.data.GetAppByChecksum(ctx, sum); err == nil {
+		if !app.Error.Valid {
+			// Skip registration since the app was already successfully
+			// registered.
+			return nil
+		}
+
+		// Clear app error.
+		_, err = a.devserver.data.UpdateAppError(
+			ctx,
+			cqrs.UpdateAppErrorParams{
+				ID:    app.ID,
+				Error: sql.NullString{},
+			},
+		)
+		if err != nil {
+			return publicerr.Wrap(err, 500, "Error updating app error")
+		}
+	}
+
+	// Attempt to get the existing app by URL, and delete it if possible.
+	// We're going to recreate it below.
+	//
+	// We need to do this as we always create an app when entering the URL
+	// via the UI.  This is a dev-server specific quirk.
+	app, err := a.devserver.data.GetAppByURL(ctx, r.URL)
+	if err == nil && app != nil {
+		_ = a.devserver.data.DeleteApp(ctx, app.ID)
+	}
+
+	// We need a UUID to register functions with.
+	appParams := cqrs.InsertAppParams{
+		// Use a deterministic ID for the app in dev.
+		ID:          uuid.NewSHA1(uuid.NameSpaceOID, []byte(r.URL)),
+		Name:        r.AppName,
+		SdkLanguage: r.SDKLanguage(),
+		SdkVersion:  r.SDKVersion(),
+		Framework: sql.NullString{
+			String: r.Framework,
+			Valid:  r.Framework != "",
+		},
+		Url:      r.URL,
+		Checksum: sum,
+	}
+
+	tx, err := a.devserver.data.WithTx(ctx)
+	if err != nil {
+		return publicerr.Wrap(err, 500, "Error starting registration tx")
+	}
+
+	defer func() {
+		// We want to save an app at the end, after handling each error.
+		if err != nil {
+			appParams.Error = sql.NullString{
+				String: err.Error(),
+				Valid:  true,
+			}
+		}
+		_, _ = tx.InsertApp(ctx, appParams)
+		err = tx.Commit(ctx)
+		if err != nil {
+			logger.From(ctx).Error().Err(err).Msg("error registering functions")
+		}
+	}()
+
+	// Get a list of all functions
+	existing, _ := tx.GetFunctionsByAppInternalID(ctx, uuid.UUID{}, appParams.ID)
+	// And get a list of functions that we've upserted.  We'll delete all existing functions not in
+	// this set.
+	seen := map[uuid.UUID]struct{}{}
+
+	// XXX (tonyhb): If we're authenticated, we can match the signing key against the workspace's
+	// signing key and warn if the user has an invalid key.
+	funcs, err := r.Parse(ctx)
+	if err != nil && err != sdk.ErrNoFunctions {
+		return publicerr.Wrap(err, 400, "At least one function is invalid")
+	}
+
+	// For each function,
+	for _, fn := range funcs {
+		// Create a new UUID for the function.
+		fn.ID = inngest.DeterministicUUID(*fn)
+
+		// Mark as seen.
+		seen[fn.ID] = struct{}{}
+
+		config, err := json.Marshal(fn)
+		if err != nil {
+			return publicerr.Wrap(err, 500, "Error marshalling function")
+		}
+
+		if _, err := tx.GetFunctionByInternalUUID(ctx, uuid.UUID{}, fn.ID); err == nil {
+			// Update the function config.
+			_, err = tx.UpdateFunctionConfig(ctx, cqrs.UpdateFunctionConfigParams{
+				ID:     fn.ID,
+				Config: string(config),
+			})
+			if err != nil {
+				return publicerr.Wrap(err, 500, "Error updating function config")
+			}
+			continue
+		}
+
+		_, err = tx.InsertFunction(ctx, cqrs.InsertFunctionParams{
+			ID:        fn.ID,
+			Name:      fn.Name,
+			Slug:      fn.Slug,
+			AppID:     appParams.ID,
+			Config:    string(config),
+			CreatedAt: time.Now(),
+		})
+		if err != nil {
+			err = fmt.Errorf("Function %s is invalid: %w", fn.Slug, err)
+			return publicerr.Wrap(err, 500, "Error saving function")
+		}
+	}
+
+	// Remove all unseen functions.
+	deletes := []uuid.UUID{}
+	for _, fn := range existing {
+		if _, ok := seen[fn.ID]; !ok {
+			deletes = append(deletes, fn.ID)
+		}
+	}
+	if len(deletes) == 0 {
+		return nil
+	}
+
+	if err = tx.DeleteFunctionsByIDs(ctx, deletes); err != nil {
+		return publicerr.Wrap(err, 500, "Error deleting removed function")
+	}
+	return nil
+}
+
+// RemoveApp allows users to de-register an app by its URL
+func (a devapi) RemoveApp(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	url := r.FormValue("url")
+
+	app, err := a.devserver.data.GetAppByURL(ctx, url)
+	if err != nil {
+		_ = publicerr.WriteHTTP(w, publicerr.Wrapf(err, 404, "App not found: %s", url))
+		return
+	}
+
+	if err := a.devserver.data.DeleteFunctionsByAppID(ctx, app.ID); err != nil {
+		_ = publicerr.WriteHTTP(w, publicerr.Wrap(err, 500, "Error deleting functions"))
+		return
+	}
+
+	if err := a.devserver.data.DeleteApp(ctx, app.ID); err != nil {
+		_ = publicerr.WriteHTTP(w, publicerr.Wrap(err, 500, "Error deleting app"))
+		return
+	}
 }
 
 func (a devapi) err(ctx context.Context, w http.ResponseWriter, status int, err error) {

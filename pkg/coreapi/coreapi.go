@@ -14,9 +14,12 @@ import (
 	"github.com/inngest/inngest/pkg/coreapi/apiutil"
 	"github.com/inngest/inngest/pkg/coreapi/generated"
 	"github.com/inngest/inngest/pkg/coreapi/graph/resolvers"
-	"github.com/inngest/inngest/pkg/coredata"
+	"github.com/inngest/inngest/pkg/cqrs"
+	"github.com/inngest/inngest/pkg/execution/queue"
 	"github.com/inngest/inngest/pkg/execution/runner"
 	"github.com/inngest/inngest/pkg/execution/state"
+	"github.com/inngest/inngest/pkg/headers"
+	"github.com/inngest/inngest/pkg/history_drivers/memory_reader"
 	"github.com/inngest/inngest/pkg/logger"
 	"github.com/inngest/inngest/pkg/publicerr"
 	"github.com/oklog/ulid/v2"
@@ -24,18 +27,21 @@ import (
 )
 
 type Options struct {
-	Config        config.Config
-	Logger        *zerolog.Logger
-	APIReadWriter coredata.APIReadWriter
-	Runner        runner.Runner
-	Tracker       *runner.Tracker
-	State         state.Manager
+	Data cqrs.Manager
+
+	Config  config.Config
+	Logger  *zerolog.Logger
+	Runner  runner.Runner
+	Tracker *runner.Tracker
+	State   state.Manager
+	Queue   queue.JobQueueReader
 }
 
 func NewCoreApi(o Options) (*CoreAPI, error) {
 	logger := o.Logger.With().Str("caller", "coreapi").Logger()
 
 	a := &CoreAPI{
+		data:    o.Data,
 		config:  o.Config,
 		log:     &logger,
 		Router:  chi.NewMux(),
@@ -51,10 +57,13 @@ func NewCoreApi(o Options) (*CoreAPI, error) {
 		AllowCredentials: false,
 	})
 	a.Use(cors.Handler)
+	a.Use(headers.StaticHeadersMiddleware(headers.ServerKindDev))
 
 	srv := handler.NewDefaultServer(generated.NewExecutableSchema(generated.Config{Resolvers: &resolvers.Resolver{
-		APIReadWriter: o.APIReadWriter,
+		Data:          o.Data,
+		HistoryReader: memory_reader.NewReader(),
 		Runner:        o.Runner,
+		Queue:         o.Queue,
 	}}))
 
 	// TODO - Add option for enabling GraphQL Playground
@@ -70,6 +79,7 @@ func NewCoreApi(o Options) (*CoreAPI, error) {
 
 type CoreAPI struct {
 	chi.Router
+	data    cqrs.Manager
 	config  config.Config
 	log     *zerolog.Logger
 	server  *http.Server

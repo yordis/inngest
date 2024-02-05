@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+
+	"github.com/inngest/inngest/pkg/consts"
 )
 
 var (
@@ -12,8 +14,10 @@ var (
 	ErrEventTooLarge      = fmt.Errorf("Event is over the max size")
 )
 
-// MaxEvents is the maximum number of events we can parse in a single batch.
-const MaxEvents = 10_000
+type StreamItem struct {
+	N    int
+	Item json.RawMessage
+}
 
 // ParseStream parses a reader, publishing a stream of JSON-encoded events to the given channel,
 // ensuring that no individual event is too large.
@@ -22,20 +26,19 @@ const MaxEvents = 10_000
 //
 // Usage:
 //
-//      var err error
-//      go func() {
-//              err = ParseStream(ctx, r, stream)
-//      ()
+//			var err error
+//			go func() {
+//			        err = ParseStream(ctx, r, stream)
+//			()
 //
-//      for bytes := range stream {
-//              // consume event, transform event, etc
-//      }
+//			for bytes := range stream {
+//			        // consume event, transform event, etc
+//			}
 //
-//      if err != nil {
-//              // handle error
-//      }
-//
-func ParseStream(ctx context.Context, r io.Reader, stream chan json.RawMessage, maxSize int) error {
+//	     if err != nil {
+//	             // handle error
+//	     }
+func ParseStream(ctx context.Context, r io.Reader, stream chan StreamItem, maxSize int) error {
 	defer func() {
 		close(stream)
 	}()
@@ -71,13 +74,19 @@ func ParseStream(ctx context.Context, r io.Reader, stream chan json.RawMessage, 
 			return fmt.Errorf("%w: Max %d bytes / Size %d bytes", ErrEventTooLarge, maxSize, len(data))
 		}
 
-		stream <- data
+		select {
+		case stream <- StreamItem{Item: data}:
+			// Sent
+		case <-ctx.Done():
+			// Early exit; a problem somewhere else in the pipeline
+			return nil
+		}
 	case '[':
 		i := 0
 		// Parse a stream of tokens
 		for d.More() {
-			if i == MaxEvents {
-				return fmt.Errorf("maximum events parsed within a batch: %d", MaxEvents)
+			if i == consts.MaxEvents {
+				return fmt.Errorf("maximum events parsed within a batch: %d", consts.MaxEvents)
 			}
 
 			jsonEvt := json.RawMessage{}
@@ -87,8 +96,14 @@ func ParseStream(ctx context.Context, r io.Reader, stream chan json.RawMessage, 
 			if len(jsonEvt) > maxSize {
 				return fmt.Errorf("%w: Max %d bytes / Size %d bytes", ErrEventTooLarge, maxSize, len(jsonEvt))
 			}
-			stream <- jsonEvt
-			i++
+			select {
+			case stream <- StreamItem{N: i, Item: jsonEvt}:
+				// Sent
+				i++
+			case <-ctx.Done():
+				// Early exit; a problem somewhere else in the pipeline
+				return nil
+			}
 		}
 	default:
 		return ErrInvalidRequestBody

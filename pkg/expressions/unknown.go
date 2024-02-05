@@ -9,7 +9,6 @@ import (
 	"github.com/google/cel-go/common/types"
 	"github.com/google/cel-go/common/types/ref"
 	"github.com/google/cel-go/interpreter"
-	"github.com/google/cel-go/interpreter/functions"
 )
 
 // unknownDecorator returns a decorator for inspecting and handling unknowns at runtime.  This
@@ -21,7 +20,7 @@ import (
 func unknownDecorator(act interpreter.PartialActivation) interpreter.InterpretableDecorator {
 	// Create a new dispatcher with all functions added
 	dispatcher := interpreter.NewDispatcher()
-	overloads := append(functions.StandardOverloads(), celOverloads()...)
+	overloads := celOverloads()
 	_ = dispatcher.Add(overloads...)
 
 	return func(i interpreter.Interpretable) (interpreter.Interpretable, error) {
@@ -29,6 +28,11 @@ func unknownDecorator(act interpreter.PartialActivation) interpreter.Interpretab
 		call, ok := i.(interpreter.InterpretableCall)
 		if !ok {
 			return i, nil
+		}
+
+		fnVal := call.OverloadID()
+		if fnVal == "" {
+			fnVal = call.Function()
 		}
 
 		argTypes := &argColl{}
@@ -43,6 +47,28 @@ func unknownDecorator(act interpreter.PartialActivation) interpreter.Interpretab
 			// A single type used within the function with no error and unknown is
 			// safe to call as usual.
 			return i, nil
+		}
+
+		// For each function that we wnat to be heterogeneous, check the types here.
+		//
+		// Only run this in the case in which we have known types;  unknowns are handled
+		// below.
+		if argTypes.TypeLen() == 2 && !argTypes.Exists(types.UnknownType) {
+			// Check if the original function is a success.
+			val := call.Eval(act)
+			if !types.IsError(val) && !types.IsUnknown(val) {
+				// Memoize this result and return it.
+				return staticCall{result: val, InterpretableCall: call}, nil
+			}
+
+			switch fnVal {
+			case operators.Add:
+				//
+				// This allows concatenation of distinct types, eg string + number.
+				//
+				str := types.String(fmt.Sprintf("%v%v", args[0].Eval(act).Value(), args[1].Eval(act).Value()))
+				return staticCall{result: str, InterpretableCall: call}, nil
+			}
 		}
 
 		if argTypes.Exists(types.ErrType) || argTypes.Exists(types.UnknownType) {
@@ -99,11 +125,12 @@ func unknownDecorator(act interpreter.PartialActivation) interpreter.Interpretab
 				return i, nil
 			}
 
-			fn, ok := dispatcher.FindOverload(call.Function())
-			if !ok {
+			// Get the actual implementation which we've copied into overloads.go.
+			fn := getBindings(call.Function(), nil)
+			if fn == nil {
 				return i, nil
 			}
-			return staticCall{result: fn.Binary(args[0], args[1]), InterpretableCall: call}, nil
+			return staticCall{result: fn(args[0], args[1]), InterpretableCall: call}, nil
 		}
 
 		return i, nil
@@ -117,6 +144,15 @@ func unknownDecorator(act interpreter.PartialActivation) interpreter.Interpretab
 // which is used in place of unknown.
 func handleUnknownCall(i interpreter.InterpretableCall, args *argColl) (interpreter.Interpretable, error) {
 	switch i.Function() {
+	case operators.Add:
+		// Find the non-unknown type and return that
+		for _, arg := range args.arguments {
+			if types.IsUnknown(arg) {
+				continue
+			}
+			return staticCall{result: arg, InterpretableCall: i}, nil
+		}
+		return staticCall{result: types.False, InterpretableCall: i}, nil
 	case operators.Equals:
 		// Comparing an unknown to null is true, else return false.
 		result := types.False

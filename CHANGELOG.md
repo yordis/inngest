@@ -1,5 +1,91 @@
 # Changelog
 
+## [v0.24.0] - 2024-01-25
+
+### Added
+- Added support for per-step errors
+- Added support for StepRun opcode
+
+## [v0.24.0] - 2024-01-17
+
+### Added
+- Added debounce timeouts
+- Added multiple concurrency keys
+- Added step invocation
+- Added improvements to apps, registration
+
+### Fixed
+- Removed goroutine handling of jobs, leading to FIFO guarantees within the job queue itself
+
+## [v0.17.0] - 2023-09-26
+
+### Added
+- A new stream page, allowing you to see all events and function runs in an easier view
+- Added a new code block to improve the UI for function outputs, step outputs, and events
+- Added support for V3 of the TS executor
+- Added a new execution lifecycle backend, and new history implementations
+
+### Fixed
+- Fixed dev server payload sizes, now conforming to cloud usage
+- Improved auto-scanning and local development flows
+
+## [v0.16.7] - 2023-08-19
+
+### Added
+- Added lifecycle handlers
+- Added history lifecycle manager
+- Added note on disabling auto-discovery on boot
+
+### Changed
+- Changed max event size dev server can ingest
+
+## [v0.16.6] - 2023-08-19
+
+### Added
+- Added initial lifecycle interface to track execution lifecycles of steps
+
+### Fixed
+- Fixed tracking of function completions from earlier regresion due to lifecycle changes
+
+## [v0.16.0] - 2023-07-31
+
+### Added
+- Added support for custom step backoff stragies specified within function code
+- Added support for scheduling functions based off of a future `ts` unix-ms timestamp within events
+- Added support for testing AWS Lambda functions locally without an AWS Gateway
+
+## [v0.15.3] - 2023-07-14
+
+### Added
+- Added the ability to prevent polling of SDKs for updates.  Any function updates must
+  be triggered by re-adding your app via the UI.
+
+### Fixed
+- Ensures new functions appear within apps automatically
+
+## [v0.15.0] - 2023-07-12
+
+### Added
+- Added apps to the dev server.  You can now submit multiple app endpoints via the UI,
+  and see apps and their statuses/errors from a tab.
+
+### Fixed
+- Fixed open-source rate limit keys
+- Fixed expression concatenation with undefined event data 
+
+
+## [v0.14.5] - 2023-06-22
+
+### Fixed
+- Fixed open-source rate limit keys
+- Fixed expression concatenation with undefined event data 
+
+## [v0.14.0] - 2023-06-09
+
+### Added
+- Added rate limiting to OSS dev server
+- Updated function definitions for V2 function config
+
 ## [v0.13.3] - 2023-05-19
 
 ### Changed

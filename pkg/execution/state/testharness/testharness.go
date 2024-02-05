@@ -5,7 +5,6 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"fmt"
-	mrand "math/rand"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -114,35 +113,34 @@ func CheckState(t *testing.T, gen Generator) {
 	t.Helper()
 
 	funcs := map[string]func(t *testing.T, m state.Manager){
-		"New":                                checkNew,
-		"New/StepData":                       checkNew_stepdata,
-		"Scheduled":                          checkScheduled,
-		"SaveResponse/Output":                checkSaveResponse_output,
-		"SaveResponse/Error":                 checkSaveResponse_error,
-		"SaveResponse/OutputOverwritesError": checkSaveResponse_outputOverwritesError,
-		"SaveResponse/Concurrent":            checkSaveResponse_concurrent,
-		"SaveResponse/Stack":                 checkSaveResponse_stack,
-		"SavePause":                          checkSavePause,
-		"LeasePause":                         checkLeasePause,
-		"ConsumePause":                       checkConsumePause,
-		"ConsumePause/WithData":              checkConsumePauseWithData,
-		"ConsumePause/WithData/StackIndex":   checkConsumePauseWithDataIndex,
-		"ConsumePause/WithEmptyData":         checkConsumePauseWithEmptyData,
-		"ConsumePause/WithEmptyDataKey":      checkConsumePauseWithEmptyDataKey,
-		"PausesByEvent/Empty":                checkPausesByEvent_empty,
-		"PausesByEvent/Single":               checkPausesByEvent_single,
-		"PausesByEvent/Multiple":             checkPausesByEvent_multi,
-		"PausesByEvent/ConcurrentCursors":    checkPausesByEvent_concurrent,
-		"PausesByEvent/Consumed":             checkPausesByEvent_consumed,
-		"PauseByStep":                        checkPausesByStep,
-		"PauseByID":                          checkPauseByID,
-		"Idempotency":                        checkIdempotency,
-		"SetStatus":                          checkSetStatus,
-		"Cancel":                             checkCancel,
-		"Cancel/AlreadyCompleted":            checkCancel_completed,
-		"Cancel/AlreadyCancelled":            checkCancel_cancelled,
-		"Finalized/Status":                   checkFinalizedStatus,
-		"Log/FunctionLog":                    checkLogs,
+		"New":                              checkNew,
+		"Exists":                           checkExists,
+		"New/StepData":                     checkNew_stepdata,
+		"UpdateMetadata":                   checkUpdateMetadata,
+		"SaveResponse/Output":              checkSaveResponse_output,
+		"SaveResponse/Concurrent":          checkSaveResponse_concurrent,
+		"SaveResponse/Stack":               checkSaveResponse_stack,
+		"SavePause":                        checkSavePause,
+		"LeasePause":                       checkLeasePause,
+		"ConsumePause":                     checkConsumePause,
+		"ConsumePause/WithData":            checkConsumePauseWithData,
+		"ConsumePause/WithData/StackIndex": checkConsumePauseWithDataIndex,
+		"ConsumePause/WithEmptyData":       checkConsumePauseWithEmptyData,
+		"ConsumePause/WithEmptyDataKey":    checkConsumePauseWithEmptyDataKey,
+		"DeletePause":                      checkDeletePause,
+		"PausesByEvent/Empty":              checkPausesByEvent_empty,
+		"PausesByEvent/Single":             checkPausesByEvent_single,
+		"PausesByEvent/Multiple":           checkPausesByEvent_multi,
+		"PausesByEvent/ConcurrentCursors":  checkPausesByEvent_concurrent,
+		"PausesByEvent/Consumed":           checkPausesByEvent_consumed,
+		"PauseByStep":                      checkPausesByStep,
+		"PauseByID":                        checkPauseByID,
+		"PausesByID":                       checkPausesByID,
+		"Idempotency":                      checkIdempotency,
+		"SetStatus":                        checkSetStatus,
+		"Cancel":                           checkCancel,
+		"Cancel/AlreadyCompleted":          checkCancel_completed,
+		"Cancel/AlreadyCancelled":          checkCancel_cancelled,
 	}
 	for name, f := range funcs {
 		t.Run(name, func(t *testing.T) {
@@ -164,9 +162,12 @@ func checkNew(t *testing.T, m state.Manager) {
 		Key:             runID.String(),
 	}
 
+	evt := input.Map()
+	batch := []map[string]any{input.Map()}
+
 	init := state.Input{
-		Identifier: id,
-		EventData:  input.Map(),
+		Identifier:     id,
+		EventBatchData: batch,
 		Context: map[string]any{
 			"some": "data",
 			"true": true,
@@ -178,7 +179,8 @@ func checkNew(t *testing.T, m state.Manager) {
 
 	found := s.Function()
 	require.EqualValues(t, w, found, "Returned workflow does not match input")
-	require.EqualValues(t, input.Map(), s.Event(), "Returned event does not match input")
+	require.EqualValues(t, evt, s.Event(), "Returned event does not match input")
+	require.EqualValues(t, batch, s.Events(), "Returned events does not match input")
 	require.EqualValues(t, enums.RunStatusRunning, s.Metadata().Status, "Status is not Running")
 	require.EqualValues(t, init.Context, s.Metadata().Context, "Metadata context not saved")
 	require.EqualValues(t, id, s.Metadata().Identifier, "Metadata didn't save Identifier")
@@ -189,9 +191,46 @@ func checkNew(t *testing.T, m state.Manager) {
 	found = loaded.Function()
 	require.EqualValues(t, w, found, "Loaded workflow does not match input")
 	require.EqualValues(t, input.Map(), loaded.Event(), "Loaded event does not match input")
+}
 
-	metadata := loaded.Metadata()
-	require.Equal(t, 1, metadata.Pending, "New should set pending count to 1")
+func checkExists(t *testing.T, m state.Manager) {
+	ctx := context.Background()
+	runID := ulid.MustNew(ulid.Now(), rand.Reader)
+	id := state.Identifier{
+		WorkflowID:      w.ID,
+		WorkflowVersion: w.FunctionVersion,
+		RunID:           runID,
+		Key:             runID.String(),
+	}
+
+	t.Run("With a random unsaved ID", func(t *testing.T) {
+		exists, err := m.Exists(ctx, ulid.MustNew(ulid.Now(), rand.Reader))
+		require.NoError(t, err)
+		require.EqualValues(t, false, exists)
+	})
+
+	t.Run("With an unsaved then saved ID", func(t *testing.T) {
+		batch := []map[string]any{input.Map()}
+		init := state.Input{
+			Identifier:     id,
+			EventBatchData: batch,
+			Context: map[string]any{
+				"some": "data",
+				"true": true,
+			},
+		}
+
+		exists, err := m.Exists(ctx, id.RunID)
+		require.NoError(t, err)
+		require.EqualValues(t, false, exists)
+
+		_, err = m.New(ctx, init)
+		require.NoError(t, err)
+
+		exists, err = m.Exists(ctx, id.RunID)
+		require.NoError(t, err)
+		require.EqualValues(t, true, exists)
+	})
 }
 
 // checkNew_stepdata ensures that state stores can be initialized with
@@ -205,9 +244,12 @@ func checkNew_stepdata(t *testing.T, m state.Manager) {
 		Key:        runID.String(),
 	}
 
+	evt := input.Map()
+	batch := []map[string]any{evt}
+
 	init := state.Input{
-		Identifier: id,
-		EventData:  input.Map(),
+		Identifier:     id,
+		EventBatchData: batch,
 		Steps: map[string]any{
 			"step-a": map[string]any{
 				"result": "predetermined",
@@ -220,7 +262,8 @@ func checkNew_stepdata(t *testing.T, m state.Manager) {
 
 	found := s.Function()
 	require.EqualValues(t, w, found, "Returned workflow does not match input")
-	require.EqualValues(t, input.Map(), s.Event(), "Returned event does not match input")
+	require.EqualValues(t, evt, s.Event(), "Returned event does not match input")
+	require.EqualValues(t, batch, s.Events(), "Returned events does not match input")
 
 	loaded, err := m.Load(ctx, s.RunID())
 	require.NoError(t, err)
@@ -229,37 +272,65 @@ func checkNew_stepdata(t *testing.T, m state.Manager) {
 	require.EqualValues(t, w, found, "Loaded workflow does not match input")
 	require.EqualValues(t, input.Map(), loaded.Event(), "Loaded event does not match input")
 
-	metadata := loaded.Metadata()
-	require.Equal(t, 1, metadata.Pending, "New should set pending count to 1")
-
 	data := loaded.Actions()
 	require.Equal(t, 1, len(data), "New should store predetermined step data")
 	require.Equal(t, init.Steps["step-a"], data["step-a"], "New should store predetermined step data")
 }
 
-func checkScheduled(t *testing.T, m state.Manager) {
+func checkUpdateMetadata(t *testing.T, m state.Manager) {
 	ctx := context.Background()
-	s := setup(t, m)
-
-	wg := &sync.WaitGroup{}
-	for i := 0; i < len(n100.Steps); i++ {
-		n := i
-		wg.Add(1)
-		go func() {
-			err := m.Scheduled(ctx, s.Identifier(), n100.Steps[n].ID, 0, nil)
-			wg.Done()
-			require.NoError(t, err)
-		}()
+	runID := ulid.MustNew(ulid.Now(), rand.Reader)
+	id := state.Identifier{
+		WorkflowID: w.ID,
+		RunID:      runID,
+		Key:        runID.String(),
+	}
+	evt := input.Map()
+	batch := []map[string]any{evt}
+	init := state.Input{
+		Identifier:     id,
+		EventBatchData: batch,
+		Steps: map[string]any{
+			"step-a": map[string]any{
+				"result": "predetermined",
+			},
+		},
+		Context: map[string]any{
+			"ok": true,
+		},
 	}
 
-	wg.Wait()
+	s, err := m.New(ctx, init)
+	require.NoError(t, err)
 
-	// Load the state again.
+	require.False(t, s.Metadata().DisableImmediateExecution)
+
+	update := state.MetadataUpdate{
+		Debugger:                  true,
+		DisableImmediateExecution: true,
+		Context: map[string]any{
+			"ok":      true,
+			"another": "yes",
+		},
+		RequestVersion: 2,
+	}
+
+	err = m.UpdateMetadata(ctx, runID, update)
+	require.NoError(t, err)
+
 	loaded, err := m.Load(ctx, s.RunID())
 	require.NoError(t, err)
-	// The trigger is always pending, and we do not account for this when
-	// initializing in setup()
-	require.EqualValues(t, len(n100.Steps)+1, loaded.Metadata().Pending, "Scheduling 100 steps concurrently should return the correct pending count via metadata")
+
+	found := loaded.Metadata()
+	require.EqualValues(t, true, found.DisableImmediateExecution)
+	require.EqualValues(t, true, found.Debugger)
+	require.EqualValues(t, update.Context, found.Context)
+	require.EqualValues(t, 2, found.RequestVersion)
+}
+
+func marshal(output any) string {
+	byt, _ := json.Marshal(output)
+	return string(byt)
 }
 
 // checkSaveResponse_output checks the basics of saving output from a response.
@@ -280,7 +351,7 @@ func checkSaveResponse_output(t *testing.T, m state.Manager) {
 		},
 	}
 
-	_, err := m.SaveResponse(ctx, s.Identifier(), r, 0)
+	err := m.SaveResponse(ctx, s.Identifier(), r.Step.ID, marshal(r.Output))
 	require.NoError(t, err)
 
 	next, err := m.Load(ctx, s.Identifier().RunID)
@@ -305,7 +376,6 @@ func checkSaveResponse_output(t *testing.T, m state.Manager) {
 
 	// And that we have no state for the second step.
 	require.Empty(t, next.Actions()[w.Steps[1].ID])
-	require.Equal(t, 1, next.Metadata().Pending)
 
 	//
 	// Check that saving a subsequent step saves the next output,
@@ -322,7 +392,7 @@ func checkSaveResponse_output(t *testing.T, m state.Manager) {
 		},
 	}
 
-	_, err = m.SaveResponse(ctx, s.Identifier(), r2, 1)
+	err = m.SaveResponse(ctx, s.Identifier(), r2.Step.ID, marshal(r2.Output))
 	require.NoError(t, err)
 
 	next, err = m.Load(ctx, s.Identifier().RunID)
@@ -345,13 +415,6 @@ func checkSaveResponse_output(t *testing.T, m state.Manager) {
 	loaded, err = next.ActionID(w.Steps[1].ID)
 	require.NoError(t, err)
 	require.EqualValues(t, r2.Output, loaded)
-	// Output shouldn't be finalized until edges are added via the runner.
-	require.Equal(t, 1, next.Metadata().Pending)
-
-	err = m.Finalized(ctx, s.Identifier(), w.Steps[0].ID, 0)
-	require.NoError(t, err)
-	err = m.Finalized(ctx, s.Identifier(), w.Steps[1].ID, 0)
-	require.NoError(t, err)
 
 	//
 	// Load() the state independently.
@@ -363,111 +426,6 @@ func checkSaveResponse_output(t *testing.T, m state.Manager) {
 	require.EqualValues(t, next.Event(), reloaded.Event())
 	require.EqualValues(t, next.Actions(), reloaded.Actions())
 	require.EqualValues(t, next.Errors(), reloaded.Errors())
-
-	// Check metadata:  we must have two finalized steps.
-	require.Equal(t, -1, reloaded.Metadata().Pending)
-}
-
-func checkSaveResponse_error(t *testing.T, m state.Manager) {
-	ctx := context.Background()
-	s := setup(t, m)
-	_, err := m.Load(ctx, s.RunID())
-	require.NoError(t, err)
-
-	r := state.DriverResponse{
-		Step: w.Steps[0],
-		Err:  fmt.Errorf("an absolutely terrible yet intermittent, non-final, retryable error"),
-	}
-	require.True(t, r.Retryable())
-	require.False(t, r.Final())
-
-	_, err = m.SaveResponse(ctx, s.Identifier(), r, 0)
-	require.NoError(t, err)
-
-	next, err := m.Load(ctx, s.Identifier().RunID)
-	require.NoError(t, err)
-	require.NotNil(t, next)
-
-	require.Nil(t, next.Actions()[r.Step.ID])
-	require.Contains(t, next.Errors()[r.Step.ID].Error(), r.Err.Error())
-
-	// Only the trigger, which was not yet complete.
-	require.Equal(t, 1, next.Metadata().Pending)
-
-	// Overwriting the error by setting as final should work and should
-	// finalize the error.
-	r.SetFinal()
-
-	require.False(t, r.Retryable())
-	require.True(t, r.Final())
-
-	_, err = m.SaveResponse(ctx, s.Identifier(), r, 1)
-	require.NoError(t, err)
-
-	finalized, err := m.Load(ctx, s.Identifier().RunID)
-	require.NoError(t, err)
-	require.NotNil(t, next)
-
-	require.Nil(t, finalized.Actions()[r.Step.ID])
-	require.Contains(t, finalized.Errors()[r.Step.ID].Error(), r.Err.Error())
-
-	// Next stores an outdated reference
-	require.Equal(t, 1, next.Metadata().Pending)
-	// But finalized should increaase finalized count.
-	require.Equal(t, 0, finalized.Metadata().Pending, "finalized error does not decrease pending count")
-	require.Equal(t, enums.RunStatusFailed, finalized.Metadata().Status, "finalized error does not set status to failed")
-}
-
-func checkSaveResponse_outputOverwritesError(t *testing.T, m state.Manager) {
-	ctx := context.Background()
-	s := setup(t, m)
-
-	stepErr := fmt.Errorf("an absolutely terrible yet intermittent, non-final, retryable error")
-	r := state.DriverResponse{
-		Step: w.Steps[0],
-		Err:  stepErr,
-	}
-	require.True(t, r.Retryable())
-	require.False(t, r.Final())
-
-	_, err := m.SaveResponse(ctx, s.Identifier(), r, 0)
-	require.NoError(t, err)
-
-	next, err := m.Load(ctx, s.Identifier().RunID)
-	require.NoError(t, err)
-	require.NotNil(t, next)
-
-	require.Nil(t, next.Actions()[r.Step.ID])
-	require.Contains(t, next.Errors()[r.Step.ID].Error(), r.Err.Error())
-
-	// This is not final
-	require.Equal(t, 1, next.Metadata().Pending)
-
-	r.Err = nil
-	r.Output = map[string]interface{}{
-		"u wot": "m8",
-	}
-	require.False(t, r.Final())
-
-	_, err = m.SaveResponse(ctx, s.Identifier(), r, 1)
-	require.NoError(t, err)
-
-	finalized, err := m.Load(ctx, s.Identifier().RunID)
-	require.NoError(t, err)
-	require.NotNil(t, finalized)
-
-	require.Equal(t, r.Output, finalized.Actions()[r.Step.ID])
-	// The error is still stored.
-	require.Contains(t, next.Errors()[r.Step.ID].Error(), stepErr.Error())
-	// Saving output should not finalize.
-	require.Equal(t, 1, finalized.Metadata().Pending)
-
-	err = m.Finalized(ctx, s.Identifier(), w.Steps[0].ID, 0)
-	require.NoError(t, err)
-
-	reloaded, err := m.Load(ctx, s.RunID())
-	require.NoError(t, err)
-	require.Equal(t, 0, reloaded.Metadata().Pending)
 }
 
 func checkSaveResponse_concurrent(t *testing.T, m state.Manager) {
@@ -478,13 +436,7 @@ func checkSaveResponse_concurrent(t *testing.T, m state.Manager) {
 	wg := &sync.WaitGroup{}
 	for i := 0; i < len(n100.Steps); i++ {
 		n := i
-		wg.Add(2)
-
-		go func() {
-			err := m.Scheduled(ctx, s.Identifier(), n100.Steps[n].ID, 0, nil)
-			wg.Done()
-			require.NoError(t, err)
-		}()
+		wg.Add(1)
 
 		go func() {
 			defer wg.Done()
@@ -497,9 +449,7 @@ func checkSaveResponse_concurrent(t *testing.T, m state.Manager) {
 					},
 				},
 			}
-			_, err := m.SaveResponse(ctx, id, r, mrand.Intn(3))
-			require.NoError(t, err)
-			err = m.Finalized(ctx, s.Identifier(), n100.Steps[n].ID, 0)
+			err := m.SaveResponse(ctx, id, r.Step.ID, marshal(r.Output))
 			require.NoError(t, err)
 		}()
 
@@ -508,7 +458,7 @@ func checkSaveResponse_concurrent(t *testing.T, m state.Manager) {
 
 	loaded, err := m.Load(ctx, s.RunID())
 	require.NoError(t, err)
-	require.EqualValues(t, 1, loaded.Metadata().Pending, "scheduling and finalizing concurrently should end with 1 (the trigger)")
+	require.Equal(t, len(n100.Steps), len(loaded.Actions()))
 }
 
 func checkSaveResponse_stack(t *testing.T, m state.Manager) {
@@ -525,9 +475,8 @@ func checkSaveResponse_stack(t *testing.T, m state.Manager) {
 				},
 			},
 		}
-		idx, err := m.SaveResponse(ctx, s.Identifier(), r, 0)
+		err := m.SaveResponse(ctx, s.Identifier(), r.Step.ID, marshal(r.Output))
 		require.NoError(t, err)
-		require.EqualValues(t, 1, idx)
 
 		next, err := m.Load(ctx, s.Identifier().RunID)
 		require.NoError(t, err)
@@ -537,54 +486,48 @@ func checkSaveResponse_stack(t *testing.T, m state.Manager) {
 		require.Equal(t, []string{w.Steps[0].ID}, stack)
 	})
 
-	t.Run("It doesn't amend the stack with temporary non-final errors", func(t *testing.T) {
+	t.Run("It amends the stack with a subsequent step save", func(t *testing.T) {
 		r := state.DriverResponse{
-			Step: w.Steps[1],
-			Err:  fmt.Errorf("an absolutely terrible yet intermittent, non-final, retryable error"),
+			Step:   w.Steps[1],
+			Output: "this works",
 		}
-		require.True(t, r.Retryable())
-		require.False(t, r.Final())
-
-		idx, err := m.SaveResponse(ctx, s.Identifier(), r, 0)
+		err := m.SaveResponse(ctx, s.Identifier(), r.Step.ID, marshal(r.Output))
 		require.NoError(t, err)
-		// The stack should still be 1 from the previous step.
-		require.EqualValues(t, 1, idx)
+
+		// The stack should change
 		next, err := m.Load(ctx, s.Identifier().RunID)
 		require.NoError(t, err)
 		stack := next.Stack()
-		require.EqualValues(t, 1, len(stack))
-		require.Equal(t, []string{w.Steps[0].ID}, stack)
+		require.EqualValues(t, 2, len(stack))
+		require.Equal(t, []string{w.Steps[0].ID, w.Steps[1].ID}, stack)
+		require.Equal(t, next.Actions()[r.Step.ID], "this works")
 	})
 
-	t.Run("It modifies the stack with a final error", func(t *testing.T) {
+	t.Run("It returns a duplicate error saving an ID twice", func(t *testing.T) {
 		r := state.DriverResponse{
-			Step: w.Steps[1],
-			Err:  fmt.Errorf("a permanent error"),
+			Step:   w.Steps[1],
+			Output: "do not save",
 		}
-		r.SetFinal()
-		require.False(t, r.Retryable())
-		require.True(t, r.Final())
 
-		idx, err := m.SaveResponse(ctx, s.Identifier(), r, 0)
-		require.NoError(t, err)
-		require.EqualValues(t, 2, idx)
+		err := m.SaveResponse(ctx, s.Identifier(), r.Step.ID, marshal(r.Output))
+		require.Error(t, state.ErrDuplicateResponse, err)
 
 		next, err := m.Load(ctx, s.Identifier().RunID)
+		fmt.Println(next.Actions(), r.Step.ID)
 		require.NoError(t, err)
 
 		stack := next.Stack()
 		require.EqualValues(t, 2, len(stack))
+
 		require.Equal(t, []string{w.Steps[0].ID, w.Steps[1].ID}, stack)
+		require.NotContains(t, next.Actions()[r.Step.ID], "do not save")
+		require.Equal(t, next.Actions()[r.Step.ID], "this works")
 	})
 }
 
 func checkSavePause(t *testing.T, m state.Manager) {
 	ctx := context.Background()
 	s := setup(t, m)
-
-	history, err := m.History(ctx, s.RunID())
-	require.NoError(t, err)
-	require.Equal(t, 1, len(history))
 
 	// Save a pause.
 	pause := state.Pause{
@@ -594,15 +537,8 @@ func checkSavePause(t *testing.T, m state.Manager) {
 		Incoming:   w.Steps[0].ID,
 		Expires:    state.Time(time.Now().Add(5 * time.Second)),
 	}
-	err = m.SavePause(ctx, pause)
+	err := m.SavePause(ctx, pause)
 	require.NoError(t, err)
-
-	t.Run("It stores history", func(t *testing.T) {
-		history, err := m.History(ctx, s.RunID())
-		require.NoError(t, err)
-		require.Equal(t, 2, len(history))
-		require.Equal(t, enums.HistoryTypeStepWaiting, history[len(history)-1].Type)
-	})
 
 	// XXX: Saving a pause with a past expiry is a noop.
 }
@@ -689,6 +625,60 @@ func checkLeasePause(t *testing.T, m state.Manager) {
 	require.Error(t, state.ErrPauseNotFound, err, "Leasing an expired pause should fail with ErrPauseNotFound")
 }
 
+func checkDeletePause(t *testing.T, m state.Manager) {
+	ctx := context.Background()
+	s := setup(t, m)
+
+	// Deleting always returns success
+	err := m.DeletePause(ctx, state.Pause{})
+	require.NoError(t, err)
+
+	// Save a pause.
+	evt := "some-wait-evt"
+	pause := state.Pause{
+		ID:          uuid.New(),
+		WorkspaceID: s.Identifier().WorkspaceID,
+		Identifier:  s.Identifier(),
+		Outgoing:    inngest.TriggerName,
+		Incoming:    w.Steps[0].ID,
+		StepName:    w.Steps[0].Name,
+		Event:       &evt,
+		Expires:     state.Time(time.Now().Add(state.PauseLeaseDuration * 2).UTC().Truncate(time.Second)),
+	}
+	err = m.SavePause(ctx, pause)
+	require.NoError(t, err)
+
+	ok, err := m.EventHasPauses(ctx, s.Identifier().WorkspaceID, evt)
+	require.NoError(t, err)
+	require.True(t, ok)
+
+	iter, err := m.PausesByEvent(ctx, s.Identifier().WorkspaceID, evt)
+	require.NoError(t, err)
+	require.True(t, iter.Next(ctx))
+
+	p := iter.Val(ctx)
+	p.Expires = state.Time(p.Expires.Time().UTC())
+	require.EqualValues(t, pause, *p)
+
+	t.Run("Deleting a pause works", func(t *testing.T) {
+		// Add 1ms, ensuring that the step completed history
+		// item is always after the pause history item. history is MS precision,
+		// and without this there's a small but real chance of flakiness.
+		<-time.After(time.Millisecond)
+		// Consuming the pause should work.
+		err = m.DeletePause(ctx, pause)
+		require.NoError(t, err)
+
+		ok, err := m.EventHasPauses(ctx, s.Identifier().WorkspaceID, evt)
+		require.NoError(t, err)
+		require.False(t, ok)
+
+		iter, err := m.PausesByEvent(ctx, s.Identifier().WorkspaceID, evt)
+		require.NoError(t, err)
+		require.False(t, iter.Next(ctx))
+	})
+}
+
 func checkConsumePause(t *testing.T, m state.Manager) {
 	ctx := context.Background()
 	s := setup(t, m)
@@ -709,12 +699,6 @@ func checkConsumePause(t *testing.T, m state.Manager) {
 	err = m.SavePause(ctx, pause)
 	require.NoError(t, err)
 
-	// There now should be 2 items.
-	history, err := m.History(ctx, s.RunID())
-	require.NoError(t, err)
-	require.Equal(t, 2, len(history))
-	require.Equal(t, enums.HistoryTypeStepWaiting, history[len(history)-1].Type)
-
 	t.Run("Consuming a pause works", func(t *testing.T) {
 		// Add 1ms, ensuring that the step completed history
 		// item is always after the pause history item. history is MS precision,
@@ -723,18 +707,6 @@ func checkConsumePause(t *testing.T, m state.Manager) {
 		// Consuming the pause should work.
 		err = m.ConsumePause(ctx, pause.ID, nil)
 		require.NoError(t, err)
-	})
-
-	t.Run("It stores history saying step completed", func(t *testing.T) {
-		history, err := m.History(ctx, s.RunID())
-		require.NoError(t, err)
-		require.Equal(t, 3, len(history))
-		last := history[len(history)-1]
-		require.Equal(t, enums.HistoryTypeStepCompleted, last.Type)
-		hs, ok := last.Data.(state.HistoryStep)
-		require.True(t, ok)
-		require.Equal(t, w.Steps[0].ID, hs.ID)
-		require.Equal(t, w.Steps[0].Name, hs.Name)
 	})
 
 	t.Run("Consuming a pause again fails", func(t *testing.T) {
@@ -996,6 +968,10 @@ func checkPausesByEvent_empty(t *testing.T, m state.Manager) {
 	require.NotNil(t, iter)
 	require.False(t, iter.Next(ctx))
 	require.Nil(t, iter.Val(ctx))
+
+	exists, err := m.EventHasPauses(ctx, uuid.UUID{}, "lol/nothing.my.friend")
+	require.NoError(t, err)
+	require.False(t, exists)
 }
 
 func checkPausesByEvent_single(t *testing.T, m state.Manager) {
@@ -1045,6 +1021,14 @@ func checkPausesByEvent_single(t *testing.T, m state.Manager) {
 	}
 	err = m.SavePause(ctx, unusedB)
 	require.NoError(t, err)
+
+	exists, err := m.EventHasPauses(ctx, wsA, evtA)
+	require.NoError(t, err)
+	require.True(t, exists)
+
+	exists, err = m.EventHasPauses(ctx, wsB, evtA)
+	require.NoError(t, err)
+	require.True(t, exists)
 
 	iter, err := m.PausesByEvent(ctx, wsA, evtA)
 	require.NoError(t, err)
@@ -1097,7 +1081,7 @@ func checkPausesByEvent_multi(t *testing.T, m state.Manager) {
 	n := 0
 	for iter.Next(ctx) {
 		result := iter.Val(ctx)
-		require.NotNil(t, result, "Nil pause returned from iterator")
+		require.NotNil(t, result, "Nil pause returned from iterator: %T: %s", iter, iter.Error())
 
 		found := false
 		for _, existing := range pauses {
@@ -1162,6 +1146,7 @@ func checkPausesByEvent_concurrent(t *testing.T, m state.Manager) {
 	a := 0
 	for a <= (len(pauses)/2) && iterA.Next(ctx) {
 		result := iterA.Val(ctx)
+		require.NotNil(t, result, "Nil pause returned from iterator")
 		found := false
 		for _, existing := range pauses {
 			if existing.ID == result.ID {
@@ -1456,6 +1441,52 @@ func checkPauseByID(t *testing.T, m state.Manager) {
 	require.Error(t, state.ErrPauseNotFound, err)
 }
 
+func checkPausesByID(t *testing.T, m state.Manager) {
+	ctx := context.Background()
+	s := setup(t, m)
+
+	// Save a pause.
+	a := state.Pause{
+		ID:         uuid.New(),
+		Identifier: s.Identifier(),
+		Outgoing:   inngest.TriggerName,
+		Incoming:   w.Steps[0].ID,
+		Expires:    state.Time(time.Now().Add(time.Second * 2).Truncate(time.Millisecond).UTC()),
+	}
+	b := state.Pause{
+		ID:         uuid.New(),
+		Identifier: s.Identifier(),
+		Outgoing:   inngest.TriggerName,
+		Incoming:   w.Steps[0].ID,
+		Expires:    state.Time(time.Now().Add(time.Second * 2).Truncate(time.Millisecond).UTC()),
+	}
+	err := m.SavePause(ctx, a)
+	require.NoError(t, err)
+	err = m.SavePause(ctx, b)
+	require.NoError(t, err)
+
+	found, err := m.PausesByID(ctx, a.ID)
+	require.Nil(t, err)
+	require.EqualValues(t, 1, len(found))
+	require.EqualValues(t, a, *found[0])
+
+	<-time.After(time.Second * 3)
+
+	// Finds two
+	found, err = m.PausesByID(ctx, a.ID, b.ID)
+	require.Nil(t, err)
+	require.EqualValues(t, 2, len(found))
+
+	// Consume.
+	err = m.ConsumePause(ctx, a.ID, nil)
+	require.Nil(t, err, "Consuming an expired pause should work")
+
+	found, err = m.PausesByID(ctx, a.ID)
+	require.Empty(t, found, "PausesByID should not return consumed pauses")
+	require.Error(t, state.ErrPauseNotFound, err)
+	require.Equal(t, 0, len(found))
+}
+
 func checkIdempotency(t *testing.T, m state.Manager) {
 	ctx := context.Background()
 
@@ -1467,6 +1498,7 @@ func checkIdempotency(t *testing.T, m state.Manager) {
 		Key:        runID.String(),
 	}
 	data := input.Map()
+	batch := []map[string]any{data}
 
 	var errCount int32
 	var okCount int32
@@ -1484,8 +1516,8 @@ func checkIdempotency(t *testing.T, m state.Manager) {
 			copiedID.RunID = ulid.MustNew(ulid.Now(), rand.Reader)
 
 			init := state.Input{
-				Identifier: copiedID,
-				EventData:  data,
+				Identifier:     copiedID,
+				EventBatchData: batch,
 			}
 
 			_, err := m.New(ctx, init)
@@ -1515,8 +1547,8 @@ func checkSetStatus(t *testing.T, m state.Manager) {
 	}
 
 	init := state.Input{
-		Identifier: id,
-		EventData:  input.Map(),
+		Identifier:     id,
+		EventBatchData: []map[string]any{input.Map()},
 	}
 
 	s, err := m.New(ctx, init)
@@ -1532,10 +1564,6 @@ func checkSetStatus(t *testing.T, m state.Manager) {
 	reloaded, err := m.Load(ctx, s.RunID())
 	require.NoError(t, err)
 	require.EqualValues(t, enums.RunStatusOverflowed, reloaded.Metadata().Status, "Status is not Overflowed")
-
-	history, err := m.History(ctx, s.RunID())
-	require.NoError(t, err)
-	require.Equal(t, enums.HistoryTypeFunctionStatusUpdated, history[len(history)-1].Type)
 }
 
 func checkCancel(t *testing.T, m state.Manager) {
@@ -1548,8 +1576,8 @@ func checkCancel(t *testing.T, m state.Manager) {
 	}
 
 	init := state.Input{
-		Identifier: id,
-		EventData:  input.Map(),
+		Identifier:     id,
+		EventBatchData: []map[string]any{input.Map()},
 	}
 
 	s, err := m.New(ctx, init)
@@ -1565,10 +1593,6 @@ func checkCancel(t *testing.T, m state.Manager) {
 	reloaded, err := m.Load(ctx, s.RunID())
 	require.NoError(t, err)
 	require.EqualValues(t, enums.RunStatusCancelled, reloaded.Metadata().Status, "Status is not Cancelled")
-
-	history, err := m.History(ctx, s.RunID())
-	require.NoError(t, err)
-	require.Equal(t, enums.HistoryTypeFunctionCancelled, history[len(history)-1].Type)
 }
 
 func checkCancel_cancelled(t *testing.T, m state.Manager) {
@@ -1580,8 +1604,8 @@ func checkCancel_cancelled(t *testing.T, m state.Manager) {
 		Key:        runID.String(),
 	}
 	init := state.Input{
-		Identifier: id,
-		EventData:  input.Map(),
+		Identifier:     id,
+		EventBatchData: []map[string]any{input.Map()},
 	}
 
 	s, err := m.New(ctx, init)
@@ -1610,8 +1634,8 @@ func checkCancel_completed(t *testing.T, m state.Manager) {
 		Key:        runID.String(),
 	}
 	init := state.Input{
-		Identifier: id,
-		EventData:  input.Map(),
+		Identifier:     id,
+		EventBatchData: []map[string]any{input.Map()},
 	}
 
 	s, err := m.New(ctx, init)
@@ -1621,7 +1645,7 @@ func checkCancel_completed(t *testing.T, m state.Manager) {
 	// Add time so that the history ticks a millisecond
 	<-time.After(time.Millisecond)
 
-	err = m.Finalized(ctx, s.Identifier(), w.Steps[0].ID, 0)
+	err = m.SetStatus(ctx, s.Identifier(), enums.RunStatusCompleted)
 	require.NoError(t, err)
 
 	s, err = m.Load(ctx, s.RunID())
@@ -1637,231 +1661,6 @@ func checkCancel_completed(t *testing.T, m state.Manager) {
 	s, err = m.Load(ctx, s.RunID())
 	require.NoError(t, err)
 	require.EqualValues(t, enums.RunStatusCompleted, s.Metadata().Status, "Status is not Complete after finalizing")
-}
-
-func checkFinalizedStatus(t *testing.T, m state.Manager) {
-	ctx := context.Background()
-	s := setup(t, m)
-	loaded, err := m.Load(ctx, s.RunID())
-	require.NoError(t, err)
-	require.Equal(t, enums.RunStatusRunning, loaded.Metadata().Status, fmt.Sprintf("expected status to be %d", enums.RunStatusRunning))
-
-	// Finalize, reducing count to 0 which should set status to complete.
-	err = m.Finalized(ctx, s.Identifier(), inngest.TriggerName, 0)
-	require.NoError(t, err)
-
-	loaded, err = m.Load(ctx, s.RunID())
-	require.NoError(t, err)
-	require.Equal(t, enums.RunStatusCompleted, loaded.Metadata().Status, "Finalizing step setting pending to 0 should set status to enums.RunStatusComplete")
-	require.Equal(t, 0, loaded.Metadata().Pending)
-
-	t.Run("It doesn't overwrite cancelled statuses, etc", func(t *testing.T) {
-		s = setup(t, m)
-
-		err = m.Cancel(ctx, s.Identifier())
-		require.NoError(t, err)
-
-		loaded, err := m.Load(ctx, s.RunID())
-		require.NoError(t, err)
-		require.Equal(t, enums.RunStatusCancelled, loaded.Metadata().Status)
-
-		err = m.Finalized(ctx, s.Identifier(), inngest.TriggerName, 0)
-		require.NoError(t, err)
-
-		loaded, err = m.Load(ctx, s.RunID())
-		require.NoError(t, err)
-		require.Equal(t, enums.RunStatusCancelled, loaded.Metadata().Status)
-	})
-
-	t.Run("It allows Failed statuses which write to history", func(t *testing.T) {
-		s = setup(t, m)
-
-		err = m.Finalized(ctx, s.Identifier(), inngest.TriggerName, 0, enums.RunStatusFailed)
-		require.NoError(t, err)
-
-		loaded, err := m.Load(ctx, s.RunID())
-		require.NoError(t, err)
-		require.Equal(t, enums.RunStatusFailed, loaded.Metadata().Status)
-
-		history, err := m.History(ctx, s.RunID())
-		require.NoError(t, err)
-		require.Equal(t, enums.HistoryTypeFunctionFailed, history[len(history)-1].Type)
-	})
-}
-
-func checkLogs(t *testing.T, m state.Manager) {
-	t.Helper()
-
-	ctx := context.Background()
-	s := setup(t, m)
-
-	t.Run("New() stores HistoryTypeFunctionStarted", func(t *testing.T) {
-		history, err := m.History(ctx, s.RunID())
-
-		require.NoError(t, err)
-		require.Equal(t, 1, len(history))
-		require.Equal(t, enums.HistoryTypeFunctionStarted, history[0].Type)
-	})
-
-	t.Run("Started() stores HistoryTypeStepStarted with attempt information", func(t *testing.T) {
-		s = setup(t, m)
-		<-time.After(time.Millisecond)
-
-		err := m.Started(ctx, s.Identifier(), w.Steps[0].ID, 2)
-		require.NoError(t, err)
-
-		history, err := m.History(ctx, s.RunID())
-		require.NoError(t, err)
-		require.Equal(t, 2, len(history))
-
-		started := history[1]
-
-		require.Equal(t, enums.HistoryTypeStepStarted.String(), started.Type.String())
-		require.NotNil(t, started.Data)
-
-		stepdata, ok := started.Data.(state.HistoryStep)
-		require.True(t, ok, "step data is %T instead of state.HistoryStep", started.Data)
-		require.Equal(t, 2, stepdata.Attempt)
-	})
-
-	t.Run("SaveResponse() with a non-final error stores HistoryTypeStepErrored", func(t *testing.T) {
-		s = setup(t, m)
-		<-time.After(time.Millisecond)
-
-		r := state.DriverResponse{
-			Step: w.Steps[0],
-			Err:  fmt.Errorf("lol"),
-		}
-		_, err := m.SaveResponse(ctx, s.Identifier(), r, 2)
-		require.NoError(t, err)
-
-		history, err := m.History(ctx, s.RunID())
-		require.NoError(t, err)
-		require.Equal(t, 2, len(history))
-
-		errored := history[1]
-
-		require.Equal(t, enums.HistoryTypeStepErrored.String(), errored.Type.String())
-		require.NotNil(t, errored.Data)
-
-		stepdata, ok := errored.Data.(state.HistoryStep)
-		require.True(t, ok, "step data is %T instead of state.HistoryStep (%v)", errored.Data, errored.Data)
-		require.Equal(t, 2, stepdata.Attempt)
-		require.Equal(t, w.Steps[0].ID, stepdata.ID)
-		require.Equal(t, w.Steps[0].Name, stepdata.Name)
-	})
-
-	t.Run("SaveResponse() with a final error stores HistoryTypeStepFailed and HistoryTypeFunctionFailed", func(t *testing.T) {
-		s = setup(t, m)
-		<-time.After(time.Millisecond)
-
-		r := state.DriverResponse{
-			Step: w.Steps[0],
-			Err:  fmt.Errorf("lol"),
-		}
-		r.SetFinal()
-
-		_, err := m.SaveResponse(ctx, s.Identifier(), r, 2)
-		require.NoError(t, err)
-
-		history, err := m.History(ctx, s.RunID())
-		require.NoError(t, err)
-		require.Equal(t, 3, len(history))
-
-		historyStep := history[1]
-		historyFunc := history[2]
-
-		require.Equal(t, enums.HistoryTypeStepFailed.String(), historyStep.Type.String())
-		require.Equal(t, enums.HistoryTypeFunctionFailed.String(), historyFunc.Type.String())
-
-		stepdata, ok := historyStep.Data.(state.HistoryStep)
-		require.True(t, ok, "step data is %T instead of state.HistoryStep (%v)", historyStep.Data, historyStep.Data)
-		require.Equal(t, 2, stepdata.Attempt)
-		require.Equal(t, w.Steps[0].ID, stepdata.ID)
-		require.Equal(t, w.Steps[0].Name, stepdata.Name)
-	})
-
-	t.Run("SaveResponse() with step data stores HistoryTypeStepCompleted", func(t *testing.T) {
-		s = setup(t, m)
-		<-time.After(time.Millisecond)
-
-		r := state.DriverResponse{
-			Step:   w.Steps[0],
-			Output: map[string]any{"ok": true},
-		}
-		_, err := m.SaveResponse(ctx, s.Identifier(), r, 2)
-		require.NoError(t, err)
-
-		history, err := m.History(ctx, s.RunID())
-		require.NoError(t, err)
-		require.Equal(t, 2, len(history))
-
-		historyStep := history[1]
-
-		require.Equal(t, enums.HistoryTypeStepCompleted.String(), historyStep.Type.String())
-
-		stepdata, ok := historyStep.Data.(state.HistoryStep)
-		require.True(t, ok, "step data is %T instead of state.HistoryStep (%v)", historyStep.Data, historyStep.Data)
-		require.Equal(t, 2, stepdata.Attempt)
-		require.Equal(t, w.Steps[0].ID, stepdata.ID)
-		require.Equal(t, w.Steps[0].Name, stepdata.Name)
-	})
-
-	t.Run("Scheduled() stores HistoryTypeStepScheduled", func(t *testing.T) {
-		s = setup(t, m)
-		<-time.After(time.Millisecond)
-
-		err := m.Scheduled(ctx, s.Identifier(), w.Steps[0].ID, 2, nil)
-		require.NoError(t, err)
-
-		history, err := m.History(ctx, s.RunID())
-		require.NoError(t, err)
-		require.Equal(t, 2, len(history))
-
-		historyStep := history[1]
-		require.Equal(t, enums.HistoryTypeStepScheduled.String(), historyStep.Type.String())
-
-		stepdata, ok := historyStep.Data.(state.HistoryStep)
-		require.True(t, ok, "step data is %T instead of state.HistoryStep (%v)", historyStep.Data, historyStep.Data)
-		require.Equal(t, 2, stepdata.Attempt)
-		require.Equal(t, w.Steps[0].ID, stepdata.ID)
-		// TODO
-		// require.Equal(t, w.Steps[0].Name, stepdata.Name)
-	})
-
-	t.Run("Finalized() does nothing with a >0 pending count", func(t *testing.T) {
-		s = setup(t, m)
-		err := m.Scheduled(ctx, s.Identifier(), w.Steps[0].ID, 2, nil)
-		require.NoError(t, err)
-
-		reloaded, err := m.Load(ctx, s.RunID())
-		require.NoError(t, err)
-		require.EqualValues(t, 2, reloaded.Metadata().Pending)
-
-		err = m.Finalized(ctx, s.Identifier(), w.Steps[0].ID, 2)
-		require.NoError(t, err)
-
-		history, err := m.History(ctx, s.RunID())
-		require.NoError(t, err)
-		require.Equal(t, 2, len(history))
-	})
-
-	t.Run("Finalized() stores HistoryTypeFunctionComplete if pending count transitions to 0", func(t *testing.T) {
-		s = setup(t, m)
-		<-time.After(time.Millisecond)
-
-		require.EqualValues(t, 1, s.Metadata().Pending)
-
-		err := m.Finalized(ctx, s.Identifier(), w.Steps[0].ID, 2)
-		require.NoError(t, err)
-
-		history, err := m.History(ctx, s.RunID())
-		require.NoError(t, err)
-		require.Equal(t, 2, len(history))
-
-		historyStep := history[1]
-		require.Equal(t, enums.HistoryTypeFunctionCompleted.String(), historyStep.Type.String())
-	})
 }
 
 // TODO: Optimization - when finalizing steps, we should delete all pauses when the counter is set to 0
@@ -1911,14 +1710,15 @@ func setup(t *testing.T, m state.Manager) state.State {
 	ctx := context.Background()
 	runID := ulid.MustNew(ulid.Now(), rand.Reader)
 	id := state.Identifier{
-		WorkflowID: w.ID,
-		RunID:      runID,
-		Key:        runID.String(),
+		WorkflowID:  w.ID,
+		RunID:       runID,
+		Key:         runID.String(),
+		WorkspaceID: w.ID, // use same ID as fn ID
 	}
 
 	init := state.Input{
-		Identifier: id,
-		EventData:  input.Map(),
+		Identifier:     id,
+		EventBatchData: []map[string]any{input.Map()},
 	}
 
 	s, err := m.New(ctx, init)

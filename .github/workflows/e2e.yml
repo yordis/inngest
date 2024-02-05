@@ -1,13 +1,17 @@
-name: E2E
+name: SDK E2E Tests
 
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - "ui/apps/dashboard/**"
   pull_request:
+    paths-ignore:
+      - "ui/apps/dashboard/**"
 
 jobs:
-  install:
-    name: E2E tests
+  ts:
+    name: TS SDK Tests
     strategy:
       matrix:
         os: [ubuntu-latest]
@@ -17,15 +21,24 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v2
         with:
-          go-version: '1.20'
+          go-version: "1.21"
+      - uses: actions/setup-node@v3
+        with:
+          node-version: "18"
+      - name: Install pnpm
+        uses: pnpm/action-setup@v2
+        with:
+          version: 8.6.2
+      - name: Build UI
+        run: make build-ui
       - name: Build dev serve
         run: |
           go build -o ./inngest-bin ./cmd/main.go
       - name: Run E2E tests
         run: |
           cd ./tests/js
-          yarn install
-          yarn dev &
+          pnpm install
+          pnpm dev &
           sleep 5
           cd ../../
           echo "Running dev server"
@@ -33,4 +46,34 @@ jobs:
           echo "Ran dev server"
           sleep 5
           curl http://127.0.0.1:8288/dev > /dev/null 2> /dev/null
-          INNGEST_SIGNING_KEY=test API_URL=http://127.0.0.1:8288 SDK_URL=http://127.0.0.1:3000/api/inngest go test ./tests -v
+          go test ./tests -v
+        env:
+          INNGEST_SIGNING_KEY: test
+          API_URL: http://127.0.0.1:8288
+          SDK_URL: http://127.0.0.1:3000/api/inngest
+  golang:
+    name: Go SDK Tests
+    strategy:
+      matrix:
+        os: [ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v2
+      - name: Set up Go
+        uses: actions/setup-go@v2
+        with:
+          go-version: "1.21"
+      - name: Build dev server
+        run: |
+          go build -o ./inngest-bin ./cmd/main.go
+      - name: Run E2E tests
+        run: |
+          echo "Running dev server"
+          nohup ./inngest-bin dev --no-discovery 2> /tmp/dev-output.txt &
+          echo "Ran dev server"
+          sleep 5
+          curl http://127.0.0.1:8288/dev > /dev/null 2> /dev/null
+          go test ./tests/golang -v -count=1
+        env:
+          INNGEST_SIGNING_KEY: 7468697320697320612074657374206b6579
+          INNGEST_DEV: http://127.0.0.1:8288

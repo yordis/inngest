@@ -2,40 +2,126 @@ package executor
 
 import (
 	"context"
-	"fmt"
+	"crypto/rand"
 	"time"
 
+	"github.com/inngest/inngest/pkg/consts"
+	"github.com/inngest/inngest/pkg/enums"
+	"github.com/inngest/inngest/pkg/event"
+	"github.com/inngest/inngest/pkg/execution"
 	"github.com/inngest/inngest/pkg/execution/state"
-	"github.com/inngest/inngest/pkg/expressions"
-	"github.com/xhit/go-str2duration/v2"
+	"github.com/inngest/inngest/pkg/logger"
+	"github.com/oklog/ulid/v2"
 )
 
-func ParseWait(ctx context.Context, wait string, s state.State, outgoingID string) (time.Duration, error) {
-	// Attempt to parse a basic duration.
-	if dur, err := str2duration.ParseDuration(wait); err == nil {
-		return dur, nil
+var metadataCtxKey = metadataCtxType{}
+
+type metadataCtxType struct{}
+
+// WithContextMetadata stores the given function run metadata within the given context.
+func WithContextMetadata(ctx context.Context, m state.Metadata) context.Context {
+	return context.WithValue(ctx, metadataCtxKey, &m)
+}
+
+// GetContextMetadata returns function run metadata stored in context or nil if not present.
+func GetContextMetadata(ctx context.Context) *state.Metadata {
+	val, _ := ctx.Value(metadataCtxKey).(*state.Metadata)
+	return val
+}
+
+// GetFunctionMetadata returns a function run's metadata.  This attempts to load metadata
+// from context first, to reduce state store reads, falling back to the state.Manager's Metadata()
+// method if the metadata does not exist in context.
+func GetFunctionRunMetadata(ctx context.Context, sm state.Manager, runID ulid.ULID) (*state.Metadata, error) {
+	if val := GetContextMetadata(ctx); val != nil {
+		return val, nil
+	}
+	return sm.Metadata(ctx, runID)
+}
+
+// OpcodeGroup is a group of opcodes that can be processed in parallel.
+type OpcodeGroup struct {
+	// Opcodes is the list of opcodes in the group.
+	Opcodes []*state.GeneratorOpcode
+	// ShouldStartHistoryGroup indicates whether each item in the group should
+	// start a new history group. This is true if the overall list of opcodes
+	// received from an SDK Call Request contains more than one opcode.
+	ShouldStartHistoryGroup bool
+}
+
+// OpcodeGroups are groups opcodes by their type, helping to run `waitForEvent`
+// opcodes first. This is used to ensure that we save wait triggers as soon as
+// possible, as well as capturing expression errors early.
+type OpcodeGroups struct {
+	// PriorityGroup is a group of opcodes that should be processed first.
+	PriorityGroup OpcodeGroup
+
+	// OtherGroup is a group of opcodes that should be processed after the
+	// priority group.
+	OtherGroup OpcodeGroup
+}
+
+// opGroups groups opcodes by their type.
+func opGroups(opcodes []*state.GeneratorOpcode) OpcodeGroups {
+	shouldStartHistoryGroup := len(opcodes) > 1
+
+	groups := OpcodeGroups{
+		PriorityGroup: OpcodeGroup{
+			Opcodes:                 []*state.GeneratorOpcode{},
+			ShouldStartHistoryGroup: shouldStartHistoryGroup,
+		},
+		OtherGroup: OpcodeGroup{
+			Opcodes:                 []*state.GeneratorOpcode{},
+			ShouldStartHistoryGroup: shouldStartHistoryGroup,
+		},
 	}
 
-	data := state.EdgeExpressionData(ctx, s, outgoingID)
-
-	// Attempt to parse an expression, eg. "date(event.data.from) - duration(1h)"
-	out, _, err := expressions.Evaluate(ctx, wait, data)
-	if err != nil {
-		return 0, fmt.Errorf("Unable to parse wait as a duration or expression: %s", wait)
+	for _, op := range opcodes {
+		if op.Op == enums.OpcodeWaitForEvent {
+			groups.PriorityGroup.Opcodes = append(groups.PriorityGroup.Opcodes, op)
+		} else {
+			groups.OtherGroup.Opcodes = append(groups.OtherGroup.Opcodes, op)
+		}
 	}
 
-	switch typ := out.(type) {
-	case time.Time:
-		return time.Until(typ), nil
-	case time.Duration:
-		return typ, nil
-	case int:
-		// Treat ints and floats as seconds.
-		return time.Duration(typ) * time.Second, nil
-	case float64:
-		// Treat ints and floats as seconds.
-		return time.Duration(typ) * time.Second, nil
+	return groups
+}
+
+// All returns a list of all groups in the order they should be processed.
+func (g OpcodeGroups) All() []OpcodeGroup {
+	return []OpcodeGroup{g.PriorityGroup, g.OtherGroup}
+}
+
+func CreateInvokeNotFoundEvent(ctx context.Context, opts execution.InvokeNotFoundHandlerOpts) event.Event {
+	now := time.Now()
+	data := map[string]interface{}{
+		"function_id": opts.FunctionID,
+		"run_id":      opts.RunID,
 	}
 
-	return 0, fmt.Errorf("Unable to get duration from expression response: %v", out)
+	origEvt := opts.OriginalEvent.GetEvent().Map()
+	if dataMap, ok := origEvt["data"].(map[string]interface{}); ok {
+		if inngestObj, ok := dataMap[consts.InngestEventDataPrefix].(map[string]interface{}); ok {
+			if dataValue, ok := inngestObj[consts.InvokeCorrelationId].(string); ok {
+				data[consts.InvokeCorrelationId] = dataValue
+			}
+		}
+	}
+
+	if opts.Err != nil {
+		data["error"] = opts.Err
+	} else {
+		data["result"] = opts.Result
+	}
+
+	evt := event.Event{
+		ID:        ulid.MustNew(uint64(now.UnixMilli()), rand.Reader).String(),
+		Name:      event.FnFinishedName,
+		Timestamp: now.UnixMilli(),
+		Data:      data,
+	}
+
+	logger.From(ctx).Debug().Interface("event", evt).Msg("function finished event")
+
+	return evt
 }

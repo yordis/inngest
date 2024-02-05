@@ -8,11 +8,13 @@ import (
 	"net/url"
 	"sort"
 	"strings"
+	"time"
 
 	petname "github.com/dustinkirkland/golang-petname"
 	"github.com/google/uuid"
 	"github.com/gosimple/slug"
 	multierror "github.com/hashicorp/go-multierror"
+	"github.com/inngest/inngest/pkg/consts"
 	"github.com/inngest/inngest/pkg/expressions"
 	"github.com/xhit/go-str2duration/v2"
 )
@@ -50,12 +52,23 @@ type Function struct {
 	// Slug is the human-friendly ID for the function
 	Slug string `json:"slug"`
 
-	// Concurrency allows limiting the concurrency of running functions, optionally constrained
-	// by an individual concurrency key.
-	Concurrency *Concurrency `json:"concurrency,omitempty"`
+	Priority *Priority `json:"priority,omitempty"`
+
+	TTL *time.Duration `json:"ttl"`
+
+	// ConcurrencyLimits allows limiting the concurrency of running functions, optionally constrained
+	// by individual concurrency keys.
+	//
+	// Users may specify up to 2 concurrency keys.
+	Concurrency *ConcurrencyLimits `json:"concurrency,omitempty"`
+
+	Debounce *Debounce `json:"debounce,omitempty"`
 
 	// Trigger represnets the trigger for the function.
 	Triggers []Trigger `json:"triggers"`
+
+	// EventBatch determines how the function will process a list of incoming events
+	EventBatch *EventBatchConfig `json:"batchEvents,omitempty"`
 
 	// RateLimit allows specifying custom rate limiting for the function.
 	RateLimit *RateLimit `json:"rateLimit,omitempty"`
@@ -71,16 +84,24 @@ type Function struct {
 	Edges []Edge `json:"edges,omitempty"`
 }
 
-func (f Function) ConcurrencyLimit() int {
-	if f.Concurrency == nil {
-		return 0
-	}
-	return f.Concurrency.Limit
+type Priority struct {
+	Run *string `json:"run"`
 }
 
-type Concurrency struct {
-	Limit int     `json:"limit"`
-	Key   *string `json:"key,omitempty"`
+type Debounce struct {
+	Key     *string `json:"key,omitempty"`
+	Period  string  `json:"period"`
+	Timeout *string `json:"timeout,omitempty"`
+}
+
+func (d Debounce) TimeoutDuration() *time.Duration {
+	if d.Timeout == nil || *d.Timeout == "" {
+		return nil
+	}
+	if dur, err := str2duration.ParseDuration(*d.Timeout); err == nil {
+		return &dur
+	}
+	return nil
 }
 
 // Cancel represents a cancellation signal for a function.  When specified, this
@@ -90,6 +111,15 @@ type Cancel struct {
 	Event   string  `json:"event"`
 	Timeout *string `json:"timeout,omitempty"`
 	If      *string `json:"if,omitempty"`
+}
+
+// ConcurrencyLimit returns the limit for the function itself, ie. the concurrnecy limit
+// set without keys and scoped to the function.
+func (f Function) ConcurrencyLimit() int {
+	if f.Concurrency != nil {
+		return f.Concurrency.PartitionConcurrency()
+	}
+	return 0
 }
 
 // GetSlug returns the function slug, defaulting to creating a slug of the function name.
@@ -118,9 +148,22 @@ func (f Function) Validate(ctx context.Context) error {
 	if len(f.Triggers) == 0 {
 		err = multierror.Append(err, fmt.Errorf("At least one trigger is required"))
 	}
+
+	if f.Concurrency != nil {
+		if cerr := f.Concurrency.Validate(ctx); cerr != nil {
+			err = multierror.Append(err, cerr)
+		}
+	}
+
 	for _, t := range f.Triggers {
 		if terr := t.Validate(ctx); terr != nil {
 			err = multierror.Append(err, terr)
+		}
+	}
+
+	if f.EventBatch != nil {
+		if berr := f.EventBatch.IsValid(); berr != nil {
+			err = multierror.Append(err, berr)
 		}
 	}
 
@@ -143,6 +186,10 @@ func (f Function) Validate(ctx context.Context) error {
 	edges, aerr := f.AllEdges(ctx)
 	if aerr != nil {
 		return multierror.Append(err, aerr)
+	}
+
+	if len(f.Steps) != 1 {
+		err = multierror.Append(err, fmt.Errorf("Functions must contain one step"))
 	}
 
 	// Validate edges.
@@ -168,21 +215,124 @@ func (f Function) Validate(ctx context.Context) error {
 		}
 	}
 
+	// Validate priority expression
+	if f.Priority != nil && f.Priority.Run != nil {
+		if _, exprErr := expressions.NewExpressionEvaluator(ctx, *f.Priority.Run); exprErr != nil {
+			err = multierror.Append(err, fmt.Errorf("Priority.Run expression is invalid: %s", exprErr))
+		}
+		// NOTE: Priority.Run is not valid when batch is enabled.
+		if f.EventBatch != nil {
+			err = multierror.Append(err, fmt.Errorf("A function cannot specify Priority.Run and Batch together"))
+		}
+	}
+
+	// Validate cancellation expressions
+	for _, c := range f.Cancel {
+		if c.If != nil {
+			if exprErr := expressions.Validate(ctx, *c.If); exprErr != nil {
+				err = multierror.Append(err, fmt.Errorf("Cancellation expression is invalid: %s", exprErr))
+			}
+		}
+	}
+
+	if len(f.Cancel) > consts.MaxCancellations {
+		err = multierror.Append(err, fmt.Errorf("This function exceeds the max number of cancellation events: %d", consts.MaxCancellations))
+	}
+
+	if f.Debounce != nil {
+		if f.Debounce.Key != nil && *f.Debounce.Key == "" {
+			// Some clients may send an empty string.
+			f.Debounce.Key = nil
+		}
+		if f.Debounce.Key != nil {
+			// Ensure the expression is valid if present.
+			if exprErr := expressions.Validate(ctx, *f.Debounce.Key); exprErr != nil {
+				err = multierror.Append(err, fmt.Errorf("Debounce expression is invalid: %s", exprErr))
+			}
+		}
+
+		// NOTE: Debounce is not valid when batch is enabled.
+		if f.EventBatch != nil {
+			err = multierror.Append(err, fmt.Errorf("A function cannot specify batch and debounce"))
+		}
+		period, perr := str2duration.ParseDuration(f.Debounce.Period)
+		if perr != nil {
+			err = multierror.Append(err, fmt.Errorf("The debounce period of '%s' is invalid: %w", f.Debounce.Period, perr))
+		}
+		if period < consts.MinDebouncePeriod {
+			err = multierror.Append(err, fmt.Errorf("The debounce period of '%s' is less than the min of: %s", f.Debounce.Period, consts.MinDebouncePeriod))
+		}
+		if period > consts.MaxDebouncePeriod {
+			err = multierror.Append(err, fmt.Errorf("The debounce period of '%s' is greater than the max of: %s", f.Debounce.Period, consts.MaxDebouncePeriod))
+		}
+	}
+
+	// Validate rate limit expression
+	if f.RateLimit != nil {
+		if rateLimitErr := f.RateLimit.IsValid(ctx); rateLimitErr != nil {
+			err = multierror.Append(err, rateLimitErr)
+		}
+	}
+
 	return err
+}
+
+// RunPriorityFactor returns the run priority factor for this function, given an input event.
+func (f Function) RunPriorityFactor(ctx context.Context, event map[string]any) (int64, error) {
+	if f.Priority == nil || f.Priority.Run == nil {
+		return 0, nil
+	}
+
+	// Validate the expression first.
+	if err := expressions.Validate(ctx, *f.Priority.Run); err != nil {
+		return 0, fmt.Errorf("Priority.Run expression is invalid: %s", err)
+	}
+
+	expr, err := expressions.NewExpressionEvaluator(ctx, *f.Priority.Run)
+	if err != nil {
+		// This should never happen.
+		return 0, fmt.Errorf("Priority.Run expression is invalid: %s", err)
+	}
+
+	val, _, err := expr.Evaluate(ctx, expressions.NewData(map[string]any{"event": event}))
+	if err != nil {
+		return 0, fmt.Errorf("Priority.Run expression errored: %s", err)
+	}
+
+	var result int64
+
+	switch v := val.(type) {
+	case int:
+		result = int64(v)
+	case int64:
+		result = v
+	default:
+		return 0, fmt.Errorf("Priority.Run expression returned non-int: %v", val)
+	}
+
+	// Apply bounds
+	if result > consts.PriorityFactorMax {
+		return consts.PriorityFactorMax, nil
+	}
+	if result < consts.PriorityFactorMin {
+		return consts.PriorityFactorMin, nil
+	}
+
+	return result, nil
+}
+
+// URI returns the function's URI.  It is expected that the function has already been
+// validated.
+func (f Function) URI() (*url.URL, error) {
+	if len(f.Steps) >= 1 {
+		return url.Parse(f.Steps[0].URI)
+	}
+	return nil, fmt.Errorf("No steps configured")
 }
 
 // AllEdges produces edge configuration for steps defined within the function.
 // If no edges for a step exists, an automatic step from the tirgger is added.
 func (f Function) AllEdges(ctx context.Context) ([]Edge, error) {
-	// This has no defined actions, which means its an implicit
-	// single action invocation.  We assume that a Dockerfile
-	// exists in the project root, and that we can build the
-	// image which contains all of the code necessary to run
-	// the function.
-	if len(f.Steps) == 0 {
-		return nil, fmt.Errorf("This function has no steps")
-	}
-
 	edges := []Edge{}
 
 	// O1 lookup of steps.
@@ -231,7 +381,8 @@ func (f Function) AllEdges(ctx context.Context) ([]Edge, error) {
 // DeterministicUUID returns a deterministic V3 UUID based off of the SHA1
 // hash of the function's name.
 func DeterministicUUID(f Function) uuid.UUID {
-	return uuid.NewSHA1(uuid.NameSpaceOID, []byte(f.Name))
+	str := f.Name + f.Steps[0].URI
+	return uuid.NewSHA1(uuid.NameSpaceOID, []byte(str))
 }
 
 func RandomID() (string, error) {

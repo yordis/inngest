@@ -7,16 +7,13 @@ Output:
 ]]
 
 local idempotencyKey = KEYS[1]
-local eventKey = KEYS[2]
+local eventsKey = KEYS[2]
 local metadataKey = KEYS[3]
 local stepKey = KEYS[4]
-local logKey = KEYS[5]
 
-local event = ARGV[1]
+local events = ARGV[1]
 local metadata = ARGV[2]
 local steps = ARGV[3]
-local log = ARGV[4]
-local logScore = tonumber(ARGV[5])
 
 if redis.call("SETNX", idempotencyKey, "") == 0 then
   -- If this key exists, everything must've been initialised, so we can exit early
@@ -26,7 +23,7 @@ end
 local metadataJson = cjson.decode(metadata)
 for k, v in pairs(metadataJson) do
   if k == "ctx" or k == "id" then
-	  v = cjson.encode(v)
+    v = cjson.encode(v)
   end
   redis.call("HSET", metadataKey, k, tostring(v))
 end
@@ -39,7 +36,6 @@ if steps ~= nil and steps ~= "" then
   end
 end
 
-redis.call("SETNX", eventKey, event)
-redis.call("ZADD", logKey, logScore, log)
+redis.call("SETNX", eventsKey, events)
 
 return 0

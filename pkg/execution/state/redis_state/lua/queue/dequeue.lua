@@ -13,9 +13,12 @@ local idempotencyKey = KEYS[4]
 -- We must dequeue our queue item ID from each concurrency queue
 local accountConcurrencyKey   = KEYS[5] -- Account concurrency level
 local partitionConcurrencyKey = KEYS[6] -- Partition (function) concurrency level
-local customConcurrencyKey    = KEYS[7] -- Optional for eg. for concurrency amongst steps 
+local customConcurrencyKeyA   = KEYS[7] -- Optional for eg. for concurrency amongst steps 
+local customConcurrencyKeyB   = KEYS[8] -- Optional for eg. for concurrency amongst steps 
 -- We push pointers to partition concurrency items to the partition concurrency item
-local concurrencyPointer      = KEYS[8]
+local concurrencyPointer      = KEYS[9]
+local keyItemIndexA           = KEYS[10]   -- custom item index 1
+local keyItemIndexB           = KEYS[11]  -- custom item index 2
 
 local queueID        = ARGV[1]
 local idempotencyTTL = tonumber(ARGV[2])
@@ -45,8 +48,11 @@ redis.call("ZREM", partitionConcurrencyKey, item.id)
 if accountConcurrencyKey ~= nil and accountConcurrencyKey ~= "" then
 	redis.call("ZREM", accountConcurrencyKey, item.id)
 end
-if customConcurrencyKey ~= nil and customConcurrencyKey ~= "" then
-	redis.call("ZREM", customConcurrencyKey, item.id)
+if customConcurrencyKeyA ~= nil and customConcurrencyKeyA ~= "" then
+	redis.call("ZREM", customConcurrencyKeyA, item.id)
+end
+if customConcurrencyKeyB ~= nil and customConcurrencyKeyB ~= "" then
+	redis.call("ZREM", customConcurrencyKeyB, item.id)
 end
 
 -- Get the earliest item in the partition concurrency set.  We may be requeueing
@@ -63,6 +69,14 @@ else
 		-- Ensure that we update the score with the earliest lease
 		redis.call("ZADD", concurrencyPointer, earliestLease, partitionName)
 	end
+end
+
+-- Add optional indexes.
+if keyItemIndexA ~= "" and keyItemIndexA ~= false and keyItemIndexA ~= nil then
+	redis.call("ZREM", keyItemIndexA, queueID)
+end
+if keyItemIndexB ~= "" and keyItemIndexB ~= false and keyItemIndexB ~= nil then
+	redis.call("ZREM", keyItemIndexB, queueID)
 end
 
 return 0

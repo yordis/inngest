@@ -3,8 +3,10 @@ package driver
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 
 	"github.com/gowebpki/jcs"
+	"github.com/inngest/inngest/pkg/execution/queue"
 	"github.com/inngest/inngest/pkg/execution/state"
 	"github.com/inngest/inngest/pkg/inngest"
 )
@@ -16,46 +18,61 @@ type Driver interface {
 	Execute(
 		ctx context.Context,
 		s state.State,
+		item queue.Item,
 		edge inngest.Edge,
 		step inngest.Step,
 		stackIndex int,
+		attempt int,
 	) (*state.DriverResponse, error)
 }
 
-type FunctionStack struct {
-	Stack   []string `json:"stack"`
-	Current int      `json:"current"`
-}
-
 // MarshalV1 marshals state as an input to driver runtimes.
-func MarshalV1(ctx context.Context, s state.State, step inngest.Step, stackIndex int, env string) ([]byte, error) {
-	data := map[string]interface{}{
-		"event": s.Event(),
-		"steps": s.Actions(),
-		"ctx": map[string]interface{}{
-			// fn_id is used within entrypoints to SDK-based functions in
-			// order to specify the ID of the function to run via RPC.
-			"fn_id": s.Function().ID,
-			// env is the name of the environment that the function is running in.
-			// though this is self-discoverable most of the time, for static envs
-			// the SDK has no knowledge of the name as it only has a signing key.
-			"env": env,
-			// step_id is used within entrypoints to SDK-based functions in
-			// order to specify the step of the function to run via RPC.
-			"step_id": step.ID,
-			// XXX: Pass in opentracing context within ctx.
-			"run_id": s.RunID(),
-			"stack": FunctionStack{
+func MarshalV1(
+	ctx context.Context,
+	s state.State,
+	step inngest.Step,
+	stackIndex int,
+	env string,
+	attempt int,
+) ([]byte, error) {
+	md := s.Metadata()
+
+	req := &SDKRequest{
+		Events:  s.Events(),
+		Event:   s.Event(),
+		Actions: s.Actions(),
+		Context: &SDKRequestContext{
+			FunctionID: s.Function().ID,
+			Env:        env,
+			StepID:     step.ID,
+			RunID:      s.RunID(),
+			Stack: &FunctionStack{
 				Stack:   s.Stack(),
 				Current: stackIndex,
 			},
+			Attempt:                   attempt,
+			DisableImmediateExecution: md.DisableImmediateExecution,
 		},
+		Version: md.RequestVersion,
 	}
 
-	j, err := json.Marshal(data)
+	// empty the attrs that consume the most
+	if req.IsBodySizeTooLarge() {
+		req.Events = []map[string]any{}
+		req.Actions = map[string]any{}
+		req.UseAPI = true
+		req.Context.UseAPI = true
+	}
+
+	j, err := json.Marshal(req)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("error marshalling request to JSON: %w", err)
 	}
 
-	return jcs.Transform(j)
+	b, err := jcs.Transform(j)
+	if err != nil {
+		return nil, fmt.Errorf("error transforming request with JCS: %w", err)
+	}
+
+	return b, nil
 }

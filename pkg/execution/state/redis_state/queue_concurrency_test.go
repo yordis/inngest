@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -13,7 +14,7 @@ import (
 	osqueue "github.com/inngest/inngest/pkg/execution/queue"
 	"github.com/inngest/inngest/pkg/execution/state"
 	"github.com/oklog/ulid/v2"
-	"github.com/rueian/rueidis"
+	"github.com/redis/rueidis"
 	"github.com/stretchr/testify/require"
 )
 
@@ -22,7 +23,6 @@ func init() {
 }
 
 func TestQueuePartitionConcurrency(t *testing.T) {
-
 	r := miniredis.RunT(t)
 
 	rc, err := rueidis.NewClient(rueidis.ClientOption{
@@ -39,6 +39,7 @@ func TestQueuePartitionConcurrency(t *testing.T) {
 	limit_10 := uuid.New()
 	workflowIDs := []uuid.UUID{limit_1, limit_10}
 
+	// Limit function concurrency by workflow ID.
 	pkf := func(ctx context.Context, p QueuePartition) (string, int) {
 		switch p.WorkflowID {
 		case limit_1:
@@ -51,10 +52,17 @@ func TestQueuePartitionConcurrency(t *testing.T) {
 		}
 	}
 
+	// Create a new lifecycle listener.  This should be invoked each time we hit limits.
+	ll := testLifecycleListener{
+		l:           &sync.Mutex{},
+		concurrency: map[uuid.UUID]int{},
+	}
+
 	q := NewQueue(
 		rc,
 		WithNumWorkers(100),
 		WithPartitionConcurrencyKeyGenerator(pkf),
+		WithQueueLifecycles(ll),
 	)
 
 	var (
@@ -65,7 +73,8 @@ func TestQueuePartitionConcurrency(t *testing.T) {
 
 	// Run the queue.
 	go func() {
-		_ = q.Run(ctx, func(ctx context.Context, item osqueue.Item) error {
+		_ = q.Run(ctx, func(ctx context.Context, _ osqueue.RunInfo, item osqueue.Item) error {
+			<-time.After(jobDuration / 2)
 			// each job takes 2 seconds to complete.
 			switch item.Identifier.WorkflowID {
 			case limit_1:
@@ -74,7 +83,7 @@ func TestQueuePartitionConcurrency(t *testing.T) {
 			case limit_10:
 				atomic.AddInt32(&counter_10, 1)
 			}
-			<-time.After(jobDuration)
+			<-time.After(jobDuration / 2)
 			return nil
 		})
 	}()
@@ -110,7 +119,21 @@ func TestQueuePartitionConcurrency(t *testing.T) {
 		}
 	}
 
+	require.NotZero(t, ll.concurrency[limit_1])
+
 	diff := time.Since(start).Seconds()
 	require.Greater(t, int(diff), 10, "10 jobs should have taken at least 10 seconds")
 	require.Less(t, int(diff), 40, "10 jobs should have taken fewer than 40 seconds") // an extra 2x latency due to race checker
+}
+
+type testLifecycleListener struct {
+	l           *sync.Mutex
+	concurrency map[uuid.UUID]int
+}
+
+func (t testLifecycleListener) OnConcurrencyLimitReached(ctx context.Context, fnID uuid.UUID) {
+	t.l.Lock()
+	i := t.concurrency[fnID]
+	t.concurrency[fnID] = i + 1
+	t.l.Unlock()
 }

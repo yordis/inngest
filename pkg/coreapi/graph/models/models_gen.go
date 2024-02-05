@@ -7,6 +7,9 @@ import (
 	"io"
 	"strconv"
 	"time"
+
+	"github.com/inngest/inngest/pkg/cqrs"
+	"github.com/inngest/inngest/pkg/history_reader"
 )
 
 type FunctionRunEvent interface {
@@ -17,6 +20,10 @@ type ActionVersionQuery struct {
 	Dsn          string `json:"dsn"`
 	VersionMajor *int   `json:"versionMajor,omitempty"`
 	VersionMinor *int   `json:"versionMinor,omitempty"`
+}
+
+type CreateAppInput struct {
+	URL string `json:"url"`
 }
 
 type Event struct {
@@ -44,11 +51,15 @@ type EventsQuery struct {
 }
 
 type Function struct {
-	Name        string             `json:"name"`
 	ID          string             `json:"id"`
+	Name        string             `json:"name"`
+	Slug        string             `json:"slug"`
+	Config      string             `json:"config"`
 	Concurrency int                `json:"concurrency"`
 	Triggers    []*FunctionTrigger `json:"triggers,omitempty"`
 	URL         string             `json:"url"`
+	AppID       string             `json:"appID"`
+	App         *cqrs.App          `json:"app"`
 }
 
 type FunctionEvent struct {
@@ -62,15 +73,21 @@ type FunctionEvent struct {
 func (FunctionEvent) IsFunctionRunEvent() {}
 
 type FunctionRun struct {
-	ID           string             `json:"id"`
-	Name         *string            `json:"name,omitempty"`
-	Workspace    *Workspace         `json:"workspace,omitempty"`
-	Status       *FunctionRunStatus `json:"status,omitempty"`
-	WaitingFor   *StepEventWait     `json:"waitingFor,omitempty"`
-	PendingSteps *int               `json:"pendingSteps,omitempty"`
-	StartedAt    *time.Time         `json:"startedAt,omitempty"`
-	Timeline     []FunctionRunEvent `json:"timeline,omitempty"`
-	Event        *Event             `json:"event,omitempty"`
+	ID                string                       `json:"id"`
+	FunctionID        string                       `json:"functionID"`
+	Function          *Function                    `json:"function,omitempty"`
+	Workspace         *Workspace                   `json:"workspace,omitempty"`
+	Event             *Event                       `json:"event,omitempty"`
+	Status            *FunctionRunStatus           `json:"status,omitempty"`
+	WaitingFor        *StepEventWait               `json:"waitingFor,omitempty"`
+	PendingSteps      *int                         `json:"pendingSteps,omitempty"`
+	StartedAt         *time.Time                   `json:"startedAt,omitempty"`
+	FinishedAt        *time.Time                   `json:"finishedAt,omitempty"`
+	Output            *string                      `json:"output,omitempty"`
+	History           []*history_reader.RunHistory `json:"history"`
+	HistoryItemOutput *string                      `json:"historyItemOutput,omitempty"`
+	Name              *string                      `json:"name,omitempty"`
+	EventID           string                       `json:"eventID"`
 }
 
 type FunctionRunQuery struct {
@@ -104,6 +121,26 @@ type StepEventWait struct {
 	EventName  *string   `json:"eventName,omitempty"`
 	Expression *string   `json:"expression,omitempty"`
 	ExpiryTime time.Time `json:"expiryTime"`
+}
+
+type StreamItem struct {
+	ID        string         `json:"id"`
+	Trigger   string         `json:"trigger"`
+	Type      StreamType     `json:"type"`
+	CreatedAt time.Time      `json:"createdAt"`
+	Runs      []*FunctionRun `json:"runs,omitempty"`
+}
+
+type StreamQuery struct {
+	After                 *time.Time `json:"after,omitempty"`
+	Before                *time.Time `json:"before,omitempty"`
+	Limit                 int        `json:"limit"`
+	IncludeInternalEvents *bool      `json:"includeInternalEvents,omitempty"`
+}
+
+type UpdateAppInput struct {
+	ID  string `json:"id"`
+	URL string `json:"url"`
 }
 
 type Workspace struct {
@@ -249,6 +286,51 @@ func (e FunctionRunStatus) MarshalGQL(w io.Writer) {
 	fmt.Fprint(w, strconv.Quote(e.String()))
 }
 
+type FunctionStatus string
+
+const (
+	FunctionStatusRunning   FunctionStatus = "RUNNING"
+	FunctionStatusCompleted FunctionStatus = "COMPLETED"
+	FunctionStatusFailed    FunctionStatus = "FAILED"
+	FunctionStatusCancelled FunctionStatus = "CANCELLED"
+)
+
+var AllFunctionStatus = []FunctionStatus{
+	FunctionStatusRunning,
+	FunctionStatusCompleted,
+	FunctionStatusFailed,
+	FunctionStatusCancelled,
+}
+
+func (e FunctionStatus) IsValid() bool {
+	switch e {
+	case FunctionStatusRunning, FunctionStatusCompleted, FunctionStatusFailed, FunctionStatusCancelled:
+		return true
+	}
+	return false
+}
+
+func (e FunctionStatus) String() string {
+	return string(e)
+}
+
+func (e *FunctionStatus) UnmarshalGQL(v interface{}) error {
+	str, ok := v.(string)
+	if !ok {
+		return fmt.Errorf("enums must be strings")
+	}
+
+	*e = FunctionStatus(str)
+	if !e.IsValid() {
+		return fmt.Errorf("%s is not a valid FunctionStatus", str)
+	}
+	return nil
+}
+
+func (e FunctionStatus) MarshalGQL(w io.Writer) {
+	fmt.Fprint(w, strconv.Quote(e.String()))
+}
+
 type FunctionTriggerTypes string
 
 const (
@@ -336,5 +418,46 @@ func (e *StepEventType) UnmarshalGQL(v interface{}) error {
 }
 
 func (e StepEventType) MarshalGQL(w io.Writer) {
+	fmt.Fprint(w, strconv.Quote(e.String()))
+}
+
+type StreamType string
+
+const (
+	StreamTypeEvent StreamType = "EVENT"
+	StreamTypeCron  StreamType = "CRON"
+)
+
+var AllStreamType = []StreamType{
+	StreamTypeEvent,
+	StreamTypeCron,
+}
+
+func (e StreamType) IsValid() bool {
+	switch e {
+	case StreamTypeEvent, StreamTypeCron:
+		return true
+	}
+	return false
+}
+
+func (e StreamType) String() string {
+	return string(e)
+}
+
+func (e *StreamType) UnmarshalGQL(v interface{}) error {
+	str, ok := v.(string)
+	if !ok {
+		return fmt.Errorf("enums must be strings")
+	}
+
+	*e = StreamType(str)
+	if !e.IsValid() {
+		return fmt.Errorf("%s is not a valid StreamType", str)
+	}
+	return nil
+}
+
+func (e StreamType) MarshalGQL(w io.Writer) {
 	fmt.Fprint(w, strconv.Quote(e.String()))
 }

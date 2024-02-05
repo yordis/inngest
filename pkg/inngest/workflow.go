@@ -1,8 +1,14 @@
 package inngest
 
 import (
+	"context"
+	"errors"
+	"fmt"
+
 	"github.com/google/uuid"
 	"github.com/inngest/inngest/pkg/consts"
+	"github.com/inngest/inngest/pkg/expressions"
+	"github.com/xhit/go-str2duration/v2"
 )
 
 const (
@@ -92,12 +98,36 @@ type RateLimit struct {
 	Key *string `json:"key,omitempty"`
 }
 
+func (r RateLimit) IsValid(ctx context.Context) error {
+	if r.Limit <= 0 {
+		return errors.New("limit must be greater than 0")
+	}
+
+	if r.Key != nil {
+		if err := expressions.Validate(ctx, *r.Key); err != nil {
+			return fmt.Errorf("key is invalid: %w", err)
+		}
+	}
+
+	if r.Period == "" {
+		return errors.New("period must be specified")
+	}
+	dur, err := str2duration.ParseDuration(r.Period)
+	if err != nil {
+		return fmt.Errorf("failed to parse time duration: %w", err)
+	}
+	if dur > consts.FunctionIdempotencyPeriod {
+		return fmt.Errorf("period must be less than %s", consts.FunctionIdempotencyPeriod)
+	}
+
+	return nil
+}
+
 type Edge struct {
 	// Incoming is the name of the step to run.  This is always the name of the
 	// concrete step, even if we're running a generator.
 	Incoming string `json:"incoming"`
-	// StepPlanned is the ID of the generator step planned via enums.OpcodeStepPlanned,
-	// if this edge represents running a yielded generator step within a DAG.
+	// StepPlanned is the ID of the generator step planned via enums.OpcodeStepPlanned.
 	//
 	// We cannot use "Incoming" here as the incoming name still needs to tbe the generator.
 	IncomingGeneratorStep string `json:"gen,omitempty"`
@@ -106,6 +136,10 @@ type Edge struct {
 	// Metadata specifies the type of edge to use.  This defaults
 	// to EdgeTypeEdge - a basic link that can conditionally run.
 	Metadata *EdgeMetadata `json:"metadata,omitempty"`
+}
+
+func (e Edge) IsSource() bool {
+	return e.Outgoing == "" && e.Incoming == TriggerName || e.Outgoing == TriggerName
 }
 
 type EdgeMetadata struct {
@@ -132,10 +166,10 @@ type AsyncEdgeMetadata struct {
 
 // VersionCoinstraint represents version constraints for an action.  We use semver without
 // patches:
-// - Major versions are backwards-incompatible (eg. requesting different secrets,
-//   incompatible APIs).
-// - Minor versions are backwards compatible improvements, fixes, or additions.  We
-//   automatically use the latest minor version within every step function.
+//   - Major versions are backwards-incompatible (eg. requesting different secrets,
+//     incompatible APIs).
+//   - Minor versions are backwards compatible improvements, fixes, or additions.  We
+//     automatically use the latest minor version within every step function.
 type VersionConstraint struct {
 	Major *uint `json:"major,omitempty"`
 	Minor *uint `json:"minor,omitempty"`

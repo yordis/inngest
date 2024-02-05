@@ -1,7 +1,17 @@
+# See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
+
+.direnv/
 cmd/cmd
 target/
 dist/
 testfns/
+build/*
 
 main
-pkg/devserver/index.html
+pkg/devserver/static/
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+/.vercel/
